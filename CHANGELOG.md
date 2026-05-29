@@ -2,6 +2,28 @@
 
 ## [1.3.1] - 2026-05-29
 
+### fix: strict chat templates reject mid-conversation system messages (#62)
+
+Qwen3 / Qwen3.5 chat templates (and other strict templates) under
+llama.cpp `--jinja` raise `System message must be at the beginning.` and
+llama.cpp returns HTTP 400 — but only when `tools` are present, since
+that's when it compiles the template to build a tool-call grammar.
+SmallCode injects system-role content mid-conversation (clarifier, plan
+request, planner injection, path-validation warnings, skill activation,
+compaction summaries), producing a messages array with `system` entries
+at positions other than 0.
+
+- New `src/session/message_normalizer.js#consolidateSystemMessages()`
+  collapses all system-role messages into a single leading system
+  message (preserving order, de-duplicating identical blocks) and emits
+  only non-system turns after it.
+- Applied in both request builders (`bin/smallcode.js` and
+  `bin/model_client.js` `chatCompletion`) right before the body is sent,
+  so it catches stray system messages regardless of which path injected
+  them. Verified end-to-end against a Qwen3 model: every tool-bearing
+  request now carries exactly one system message at index 0.
+- Test coverage: `test/message_normalizer.test.js` (9 cases).
+
 ### fix: compatibility issues #57, #58, #59
 
 Three reported environment-compatibility bugs:

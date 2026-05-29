@@ -90,6 +90,7 @@ const { PluginLoader } = require('../src/plugins/loader');
 const { SkillManager } = require('../src/plugins/skills');
 const { SessionStore } = require('../src/session/persistence');
 const { resolveReferences, formatReferencesForPrompt } = require('../src/session/references');
+const { consolidateSystemMessages } = require('../src/session/message_normalizer');
 const { TokenTracker } = require('../src/session/tokens');
 const { UndoStack } = require('../src/session/undo');
 const { shouldInjectGitContext, getGitDiffContext } = require('../src/session/git_context');
@@ -2161,9 +2162,16 @@ async function chatCompletion(config, messages) {
     });
 
     const _tools = getAllTools(config, currentToolCategory);
+    // Consolidate any mid-conversation system messages into a single leading
+    // system message. Strict chat templates (Qwen3/Qwen3.5 under llama.cpp
+    // --jinja) reject a `system` role anywhere but index 0 and return HTTP 400
+    // when tools are present. SmallCode injects system content mid-stream
+    // (clarifier, plan, planner, path warnings, skills, compaction), so we
+    // normalize here, right before the request is built. See issue #62.
+    const normalizedMessages = consolidateSystemMessages([systemMsg, ...processedWithImages]);
     const body = {
       model: target.model,
-      messages: [systemMsg, ...processedWithImages],
+      messages: normalizedMessages,
       temperature: 0.1,
       max_tokens: parseInt(process.env.SMALLCODE_MAX_OUTPUT_TOKENS) || 8192,
     };

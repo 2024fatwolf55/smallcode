@@ -35,9 +35,13 @@ async function chatCompletion(ctx) {
     });
 
     const _tools = ctx.getAllTools(config);
+    // Collapse any mid-conversation system messages into a single leading one
+    // so strict chat templates (Qwen3/Qwen3.5 under llama.cpp --jinja) don't
+    // 400 with "System message must be at the beginning." See issue #62.
+    const { consolidateSystemMessages } = require('../src/session/message_normalizer');
     const body = {
       model: target.model,
-      messages: [systemMsg, ...processedMessages],
+      messages: consolidateSystemMessages([systemMsg, ...processedMessages]),
       temperature: 0.1,
       max_tokens: 4096,
     };
