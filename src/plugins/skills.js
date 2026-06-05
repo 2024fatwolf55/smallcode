@@ -16,6 +16,10 @@
 // `.agents/skills` or `.claude/skills` typically have no frontmatter — they
 // are treated as `manual`-trigger skills named after their parent directory.
 //
+// The standard skill dirs also accept the nested `<name>/SKILL.md` layout and
+// flat `.md` files without frontmatter (named after the file) — both were
+// previously skipped silently (closes #81). README-style files are ignored.
+//
 // Frontmatter accepts both LF and CRLF line endings (closes #52).
 
 const fs = require('fs');
@@ -24,6 +28,8 @@ const os = require('os');
 
 const FM_RE = /^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/;
 const KV_RE = /^(\w+)\s*:\s*(.+?)\s*$/;
+// Docs that live alongside skills but aren't skills themselves
+const NON_SKILL_MD = /^(readme|changelog|license|contributing)\.md$/i;
 
 class SkillManager {
   constructor(projectDir) {
@@ -71,14 +77,20 @@ class SkillManager {
     if (!dir || !fs.existsSync(dir)) return;
     let entries;
     try {
-      entries = fs.readdirSync(dir);
+      entries = fs.readdirSync(dir, { withFileTypes: true });
     } catch {
       return;
     }
     for (const entry of entries) {
-      if (!entry.endsWith('.md')) continue;
-      const full = path.join(dir, entry);
-      this._ingestFile(full, entry, dir);
+      if (entry.isDirectory()) {
+        // <dir>/<name>/SKILL.md inside a standard skill dir — users following
+        // the Claude Code layout expect this to work (closes #81)
+        this._loadSkillFolder(path.join(dir, entry.name), entry.name);
+        continue;
+      }
+      if (!entry.name.endsWith('.md') || NON_SKILL_MD.test(entry.name)) continue;
+      const full = path.join(dir, entry.name);
+      this._ingestFile(full, entry.name, dir, entry.name.replace(/\.md$/i, ''), 'flat');
     }
   }
 
@@ -92,38 +104,41 @@ class SkillManager {
     }
     for (const d of dirs) {
       if (!d.isDirectory()) continue;
-      const skillDir = path.join(root, d.name);
-      // Look for SKILL.md, skill.md, or any .md file inside the folder.
-      let skillFile = null;
-      const candidates = ['SKILL.md', 'skill.md', 'Skill.md'];
-      for (const c of candidates) {
-        const p = path.join(skillDir, c);
-        if (fs.existsSync(p)) { skillFile = p; break; }
-      }
-      if (!skillFile) {
-        // Fall back to first .md in the folder
-        try {
-          const md = fs.readdirSync(skillDir).find(f => f.endsWith('.md'));
-          if (md) skillFile = path.join(skillDir, md);
-        } catch {}
-      }
-      if (!skillFile) continue;
-      this._ingestFile(skillFile, path.basename(skillFile), skillDir, d.name);
+      this._loadSkillFolder(path.join(root, d.name), d.name);
     }
   }
 
-  _ingestFile(filePath, filename, dir, defaultName) {
+  _loadSkillFolder(skillDir, name) {
+    // Look for SKILL.md, skill.md, or any .md file inside the folder.
+    let skillFile = null;
+    const candidates = ['SKILL.md', 'skill.md', 'Skill.md'];
+    for (const c of candidates) {
+      const p = path.join(skillDir, c);
+      if (fs.existsSync(p)) { skillFile = p; break; }
+    }
+    if (!skillFile) {
+      // Fall back to first .md in the folder
+      try {
+        const md = fs.readdirSync(skillDir).find(f => f.endsWith('.md'));
+        if (md) skillFile = path.join(skillDir, md);
+      } catch {}
+    }
+    if (!skillFile) return;
+    this._ingestFile(skillFile, path.basename(skillFile), skillDir, name, 'nested');
+  }
+
+  _ingestFile(filePath, filename, dir, defaultName, origin) {
     let content;
     try {
       content = fs.readFileSync(filePath, 'utf-8');
     } catch {
       return;
     }
-    const skill = this._parse(content, filename, dir, defaultName);
+    const skill = this._parse(content, filename, dir, defaultName, origin);
     if (skill) this.skills.set(skill.name, skill);
   }
 
-  _parse(content, filename, dir, defaultName) {
+  _parse(content, filename, dir, defaultName, origin) {
     // Parse YAML frontmatter (CRLF + LF tolerant — closes #52)
     const fmMatch = content.match(FM_RE);
     let frontmatter = '';
@@ -133,9 +148,10 @@ class SkillManager {
       frontmatter = fmMatch[1];
       body = fmMatch[2];
     } else if (!defaultName) {
-      // Flat-layout files without frontmatter aren't skills (could be a
-      // README). Nested-layout (.agents/skills/<name>/SKILL.md) files are
-      // accepted as plain-body skills using the parent directory name.
+      // Files without frontmatter and no derivable name aren't skills.
+      // Flat + nested loaders always pass a defaultName, so frontmatter-less
+      // files load as manual skills (closes #81); README-style files are
+      // filtered by name in _loadFlat.
       return null;
     }
 
@@ -155,11 +171,11 @@ class SkillManager {
 
     return {
       name: meta.name || defaultName || filename.replace(/\.md$/i, ''),
-      trigger: meta.trigger || (defaultName ? 'manual' : 'manual'),
+      trigger: meta.trigger || 'manual',
       keywords: Array.isArray(meta.keywords) ? meta.keywords : [],
       content: body.trim(),
       path: path.join(dir, filename),
-      origin: defaultName ? 'nested' : 'flat',
+      origin: origin || (defaultName ? 'nested' : 'flat'),
     };
   }
 
