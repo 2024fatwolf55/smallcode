@@ -10,7 +10,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const { parseEnvFile, PROVIDERS, formatStatus } = require('../bin/provider-wizard/status');
-const { mergeEnvFile } = require('../bin/provider-wizard/wizard');
+const { mergeEnvFile, runWizard, fetchModels } = require('../bin/provider-wizard/wizard');
 
 function tmp(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-`));
@@ -75,6 +75,89 @@ test('mergeEnvFile creates content from scratch when file missing', () => {
   // not yet written
   const out = mergeEnvFile(f, { NEW: 'yes' });
   assert.match(out, /^NEW=yes$/m);
+});
+
+// Scripted readline stand-in: answers questions in order, records close().
+function fakeRl(answers) {
+  const queue = [...answers];
+  return {
+    closed: false,
+    question(q, cb) { cb(queue.length ? queue.shift() : ''); },
+    close() { this.closed = true; },
+  };
+}
+
+async function withStubbedFetch(impl, fn) {
+  const orig = global.fetch;
+  global.fetch = impl;
+  try { return await fn(); } finally { global.fetch = orig; }
+}
+
+async function inTmpCwd(fn) {
+  const dir = tmp('sc-pw-wiz');
+  const orig = process.cwd();
+  process.chdir(dir);
+  try { return await fn(dir); } finally { process.chdir(orig); }
+}
+
+test('fetchModels returns ids from an OpenAI-compatible /models endpoint', async () => {
+  const got = await withStubbedFetch(
+    async () => ({ ok: true, json: async () => ({ data: [{ id: 'a' }, { id: 'b' }] }) }),
+    () => fetchModels('http://localhost:11434/v1'),
+  );
+  assert.deepEqual(got, ['a', 'b']);
+});
+
+test('fetchModels returns [] on unreachable server', async () => {
+  const got = await withStubbedFetch(
+    async () => { throw new Error('ECONNREFUSED'); },
+    () => fetchModels('http://localhost:1/v1'),
+  );
+  assert.deepEqual(got, []);
+});
+
+test('wizard offers local model picker and uses the selection', async () => {
+  await inTmpCwd(async (dir) => {
+    const rl = fakeRl([
+      '2',  // provider: Ollama
+      '',   // base URL: accept default
+      '2',  // model picker: second entry
+      'n',  // no escalation
+      '2',  // save to project only
+    ]);
+    const result = await withStubbedFetch(
+      async () => ({ ok: true, json: async () => ({ data: [{ id: 'm-one' }, { id: 'm-two' }] }) }),
+      () => runWizard({ interactive: true, rl }),
+    );
+    assert.equal(result.success, true);
+    assert.equal(result.model, 'm-two');
+    const env = parseEnvFile(path.join(dir, '.env'));
+    assert.equal(env.SMALLCODE_MODEL, 'm-two');
+    assert.equal(env.SMALLCODE_PROVIDER, 'ollama');
+    // Borrowed rl must not be closed by the wizard (issue: duplicated
+    // keystrokes came from a second readline on the same stdin)
+    assert.equal(rl.closed, false);
+  });
+});
+
+test('wizard falls back to free-text model when listing fails', async () => {
+  await inTmpCwd(async (dir) => {
+    const rl = fakeRl([
+      '2',            // provider: Ollama
+      '',             // base URL: accept default
+      'typed-model',  // manual model entry (picker unavailable)
+      'n',            // no escalation
+      '2',            // save to project only
+    ]);
+    const result = await withStubbedFetch(
+      async () => { throw new Error('ECONNREFUSED'); },
+      () => runWizard({ interactive: true, rl }),
+    );
+    assert.equal(result.success, true);
+    assert.equal(result.model, 'typed-model');
+    const env = parseEnvFile(path.join(dir, '.env'));
+    assert.equal(env.SMALLCODE_MODEL, 'typed-model');
+  });
 });
 
 test('formatStatus renders provider, base url, model, escalation', () => {
