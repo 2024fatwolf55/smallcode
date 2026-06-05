@@ -24,8 +24,10 @@ const SEQ = {
   hideCursor: '\x1b[?25l',
   showCursor: '\x1b[?25h',
   reset: '\x1b[0m',
-  mouseOn: '\x1b[?1000h\x1b[?1006h',   // button tracking + SGR encoding
-  mouseOff: '\x1b[?1000l\x1b[?1006l',
+  // 1000 = presses/releases/wheel, 1002 = also motion while a button is held
+  // (needed for drag-selection in the chat panel), 1006 = SGR encoding
+  mouseOn: '\x1b[?1000h\x1b[?1002h\x1b[?1006h',
+  mouseOff: '\x1b[?1002l\x1b[?1000l\x1b[?1006l',
   pasteOn: '\x1b[?2004h',              // bracketed paste
   pasteOff: '\x1b[?2004l',
 };
