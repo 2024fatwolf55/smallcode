@@ -851,6 +851,7 @@ module.exports = function createCommandHandler(config, conversationHistory, impr
         console.log(`  ${chalk.cyan('/budget')}        ${chalk.gray('Show context window budget')}`);
         console.log(`  ${chalk.cyan('/mcp')}           ${chalk.gray('Show connected MCP servers')}`);
         console.log(`  ${chalk.cyan('/skill')}         ${chalk.gray('Manage reusable skills')}`);
+        console.log(`  ${chalk.cyan('/evolve')}        ${chalk.gray('Propose a new skill from session friction (list|promote|log)')}`);
         console.log(`  ${chalk.cyan('/plugin')}        ${chalk.gray('List installed plugins')}`);
         console.log(`  ${chalk.cyan('/provider')}      ${chalk.gray('Configure LLM provider (interactive wizard)')}`);
         console.log(`  ${chalk.cyan('/sessions')}      ${chalk.gray('List/resume saved sessions')}`);
@@ -862,6 +863,161 @@ module.exports = function createCommandHandler(config, conversationHistory, impr
         console.log('');
         rl.prompt();
         return;
+
+      case '/evolve': {
+        const { SkillManager } = require('../src/plugins/skills');
+        const sm = new SkillManager(process.cwd());
+        const sub = (parts[1] || '').trim();
+
+        if (sub === 'list') {
+          const drafts = sm.listDrafts();
+          if (drafts.length === 0) {
+            console.log(chalk.gray('  No skill drafts. Run /evolve to analyze recent sessions.'));
+          } else {
+            console.log(chalk.bold(`  Drafts (${drafts.length}) — promote with /evolve promote <name>:`));
+            for (const d of drafts) console.log(`    ${chalk.cyan(d)}`);
+          }
+          console.log('');
+          rl.prompt();
+          return;
+        }
+
+        if (sub === 'promote') {
+          const name = (parts[2] || '').trim();
+          if (!name) { console.log(chalk.gray('  Usage: /evolve promote <name>')); }
+          else {
+            const target = sm.promoteDraft(name);
+            if (target) console.log(`  ${chalk.green('✓')} Promoted to ${chalk.cyan(target)} — active next session.`);
+            else console.log(chalk.red(`  Draft "${name}" not found (or a live skill with that name exists).`));
+          }
+          console.log('');
+          rl.prompt();
+          return;
+        }
+
+        if (sub === 'log') {
+          const { readEntries } = require('../src/plugins/audit_log');
+          const entries = readEntries(path.join(process.cwd(), '.smallcode', 'evolver-audit.jsonl'), 10);
+          if (entries.length === 0) console.log(chalk.gray('  No evolution events logged yet.'));
+          for (const e of entries) {
+            console.log(`  ${chalk.gray(e.ts)} ${chalk.cyan(e.name)} ${chalk.gray(e.rationale.slice(0, 60))}`);
+          }
+          console.log('');
+          rl.prompt();
+          return;
+        }
+
+        // No sub-command: run an evolution pass
+        const { TraceRecorder } = require('./trace_recorder');
+        const { extractFrictionSignals, formatReportForPrompt } = require('../src/plugins/friction_analyzer');
+        const evolver = require('../src/plugins/evolver');
+
+        const tr = new TraceRecorder(process.cwd());
+        const traceList = tr.list().slice(0, 20);
+        if (traceList.length < 3) {
+          console.log(chalk.gray(`  Only ${traceList.length} trace(s) recorded — need at least 3 sessions of data.`));
+          console.log('');
+          rl.prompt();
+          return;
+        }
+        const traces = traceList.map(t => tr.load(t.id)).filter(Boolean);
+
+        const skillKeywords = sm.list().flatMap(s => s.keywords || []);
+        const report = extractFrictionSignals(traces, { skillKeywords });
+        const signalCount = report.repeated_patterns.length + report.tool_retry_loops.length;
+        if (signalCount === 0) {
+          console.log(chalk.gray(`  No friction patterns in last ${traces.length} traces. Nothing to evolve.`));
+          console.log('');
+          rl.prompt();
+          return;
+        }
+
+        console.log(chalk.bold(`  Friction signals (${signalCount}):`));
+        console.log(chalk.gray(formatReportForPrompt(report).split('\n').map(l => '  ' + l).join('\n')));
+
+        // LLM judgment — route to the strong tier when configured
+        const { getModelTarget, buildAuthHeaders, withModelTarget } = require('./config');
+        const target = getModelTarget(config, 'strong');
+        process.stdout.write(chalk.gray(`  Asking ${target.model} for a proposal... `));
+
+        const sysPrompt = 'You design reusable skills for a coding agent. A skill is a short markdown instruction injected when relevant. Given friction signals from recent sessions, propose ONE skill addressing the most impactful pattern. Respond with ONLY a JSON object: {"name": "kebab-case-name", "description": "one line", "trigger": "match", "keywords": ["k1","k2"], "body": "markdown instructions for the agent", "rationale": "why this helps"}';
+        let proposalRaw = null;
+        try {
+          const resp = await fetch(`${target.baseUrl}/chat/completions`, {
+            method: 'POST',
+            headers: buildAuthHeaders(withModelTarget(config, target)),
+            body: JSON.stringify({
+              model: target.model,
+              messages: [
+                { role: 'system', content: sysPrompt },
+                { role: 'user', content: `Friction signals:\n${formatReportForPrompt(report)}` },
+              ],
+              temperature: 0.2,
+              max_tokens: 1024,
+            }),
+          });
+          if (resp.ok) {
+            const data = await resp.json();
+            proposalRaw = data?.choices?.[0]?.message?.content || null;
+          } else {
+            console.log(chalk.red(`HTTP ${resp.status}`));
+          }
+        } catch (e) {
+          console.log(chalk.red(e.message));
+        }
+        if (!proposalRaw) { console.log(''); rl.prompt(); return; }
+
+        // Forgiving parse: strict JSON → fenced JSON → abort with raw output
+        let parsed = null;
+        try { parsed = JSON.parse(proposalRaw); } catch {
+          const m = proposalRaw.match(/\{[\s\S]*\}/);
+          if (m) { try { parsed = JSON.parse(m[0]); } catch {} }
+        }
+        if (!parsed) {
+          console.log(chalk.yellow('could not parse'));
+          console.log(chalk.gray('  Raw model output (nothing written):'));
+          console.log(chalk.gray('  ' + proposalRaw.slice(0, 500).split('\n').join('\n  ')));
+          console.log('');
+          rl.prompt();
+          return;
+        }
+        console.log(chalk.green('ok'));
+
+        const proposal = evolver.buildSkillProposal(
+          String(parsed.name || ''), String(parsed.description || ''), String(parsed.body || ''),
+          { trigger: parsed.trigger, keywords: parsed.keywords, rationale: String(parsed.rationale || '') }
+        );
+        const errors = evolver.validateProposal(proposal);
+        if (errors.length) {
+          console.log(chalk.red(`  Proposal rejected: ${errors.join('; ')}`));
+          console.log('');
+          rl.prompt();
+          return;
+        }
+        const collision = evolver.checkNameCollision(proposal.name, process.cwd());
+        if (collision) {
+          console.log(chalk.red(`  Name collision with ${collision} — nothing written.`));
+          console.log('');
+          rl.prompt();
+          return;
+        }
+
+        const run = new evolver.EvolverRun();
+        const draftPath = run.writeDraft(proposal, process.cwd());
+        evolver.logCreateEvent(
+          path.join(process.cwd(), '.smallcode', 'evolver-audit.jsonl'),
+          proposal, proposal.rationale,
+          report.repeated_patterns.flatMap(p => p.traceIds).concat(report.tool_retry_loops.flatMap(l => l.traceIds))
+        );
+
+        console.log('');
+        console.log(`  ${chalk.green('✓')} Draft: ${chalk.cyan(draftPath)}`);
+        console.log(chalk.gray(`    "${proposal.description}"`));
+        console.log(chalk.gray(`    Review the file, then: /evolve promote ${proposal.name}`));
+        console.log('');
+        rl.prompt();
+        return;
+      }
 
       case '/provider': {
         const sub = (parts[1] || '').trim();
