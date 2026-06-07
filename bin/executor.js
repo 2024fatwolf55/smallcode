@@ -812,6 +812,19 @@ async function executeTool(name, args, ctx) {
         const objects = Array.isArray(raw) ? raw : (raw?.objects || []);
         const tokens_used = Array.isArray(raw) ? objects.length * 50 : (raw?.tokens_used || 0);
         if (objects.length === 0) return { result: 'No relevant memory found.' };
+        // Touch last_used_at so hygiene tier sweeps see real usage — an
+        // actively-retrieved entry must not age out. Never breaks retrieval.
+        for (const o of objects) {
+          try {
+            const now = new Date().toISOString();
+            if (typeof memoryStore.update === 'function') {
+              memoryStore.update(o.id, { last_used_at: now });
+            } else {
+              o.last_used_at = now;
+              if (typeof memoryStore.save === 'function') memoryStore.save();
+            }
+          } catch {}
+        }
         const formatted = objects.map(o => `[${o.type}] ${o.title}: ${o.content}`).join('\n\n');
         return { result: `Loaded ${objects.length} memories (${tokens_used} tokens):\n\n${formatted}` };
       }
