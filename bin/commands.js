@@ -307,9 +307,42 @@ module.exports = function createCommandHandler(config, conversationHistory, impr
           } catch (e) {
             console.log(chalk.gray(`  Error: ${e.message}`));
           }
+        } else if (sub === 'hygiene') {
+          try {
+            const { runHygiene } = require('../src/memory/hygiene');
+            const result = runHygiene(memoryStore);
+            console.log(chalk.green(`  ✓ Hygiene complete: ${result.archived} archived, ${result.deleted} deleted`));
+            // Also write MEMORY.md index
+            const { renderMemoryIndex } = require('../src/memory/hygiene');
+            const md = renderMemoryIndex(memoryStore);
+            const fs = require('fs');
+            const path = require('path');
+            const outDir = path.join(process.cwd(), '.smallcode');
+            if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+            fs.writeFileSync(path.join(outDir, 'MEMORY.md'), md);
+            console.log(chalk.gray(`  Wrote .smallcode/MEMORY.md (${memoryStore.all().length} entries)`));
+          } catch (e) {
+            console.log(chalk.gray(`  Hygiene error: ${e.message}`));
+          }
+        } else if (sub === 'index') {
+          try {
+            const { renderMemoryIndex } = require('../src/memory/hygiene');
+            const md = renderMemoryIndex(memoryStore);
+            const fs = require('fs');
+            const path = require('path');
+            const outDir = path.join(process.cwd(), '.smallcode');
+            if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+            fs.writeFileSync(path.join(outDir, 'MEMORY.md'), md);
+            console.log(chalk.green(`  ✓ Wrote .smallcode/MEMORY.md`));
+            console.log(md.split('\n').slice(0, 10).map(l => '  ' + l).join('\n'));
+          } catch (e) {
+            console.log(chalk.gray(`  Index error: ${e.message}`));
+          }
         } else {
-          console.log(chalk.gray('  /memory         List stored memory'));
-          console.log(chalk.gray('  /memory clear   Clear all memory'));
+          console.log(chalk.gray('  /memory           List stored memory'));
+          console.log(chalk.gray('  /memory clear     Clear all memory'));
+          console.log(chalk.gray('  /memory hygiene   Sweep tiers, prune stale entries, write MEMORY.md'));
+          console.log(chalk.gray('  /memory index     Write .smallcode/MEMORY.md without sweeping'));
         }
         console.log('');
         rl.prompt();
