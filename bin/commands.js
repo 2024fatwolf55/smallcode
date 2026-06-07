@@ -862,6 +862,114 @@ module.exports = function createCommandHandler(config, conversationHistory, impr
         return;
       }
 
+      case '/agents': {
+        const { AgentLoader } = require('../src/plugins/agent_loader');
+        const loader = new AgentLoader(process.cwd());
+        const agents = loader.list();
+        if (agents.length === 0) {
+          console.log(chalk.gray('  No agents defined.'));
+          console.log(chalk.gray('  Create one: .smallcode/agents/<name>.md'));
+        } else {
+          console.log(chalk.bold(`  Agents (${agents.length}):`));
+          for (const a of agents) {
+            const toolList = a.tools.length ? chalk.gray(` [${a.tools.join(', ')}]`) : '';
+            const modelTag = a.model ? chalk.gray(` model:${a.model}`) : '';
+            console.log(`    ${chalk.cyan(a.name)}${toolList}${modelTag} ${chalk.gray(a.description)}`);
+          }
+        }
+        console.log('');
+        rl.prompt();
+        return;
+      }
+
+      case '/agent': {
+        const agentName = parts[1];
+        const agentTask = parts.slice(2).join(' ');
+        if (!agentName || !agentTask) {
+          console.log(chalk.gray('  Usage: /agent <name> <task...>'));
+          console.log('');
+          rl.prompt();
+          return;
+        }
+        const { AgentLoader: AgentLoaderA } = require('../src/plugins/agent_loader');
+        const { AgentRunner } = require('../src/plugins/agent_runner');
+        const loaderA = new AgentLoaderA(process.cwd());
+        const agentDef = loaderA.get(agentName);
+        if (!agentDef) {
+          const valid = loaderA.list().map(a => a.name);
+          console.log(chalk.red(`  Agent "${agentName}" not found. Valid: ${valid.join(', ') || '(none)'}`));
+          console.log('');
+          rl.prompt();
+          return;
+        }
+        console.log(chalk.gray(`  Running agent ${chalk.cyan(agentName)}...`));
+        const agentCtxA = { config, flags: {}, tui: require('./tui'), skillManager: null };
+        const runnerA = new AgentRunner(agentDef, agentCtxA);
+        const resultA = await runnerA.run(agentTask);
+        console.log('');
+        console.log(resultA.output || chalk.gray('(no output)'));
+        console.log('');
+        console.log(chalk.gray(`  steps=${resultA.steps} tokens=${resultA.tokens}${resultA.error ? ' error=' + resultA.error : ''}`));
+        console.log('');
+        rl.prompt();
+        return;
+      }
+
+      case '/teams': {
+        const { TeamLoader } = require('../src/plugins/team_loader');
+        const tloader = new TeamLoader(process.cwd());
+        const teams = tloader.list();
+        if (teams.length === 0) {
+          console.log(chalk.gray('  No teams defined.'));
+          console.log(chalk.gray('  Create one: .smallcode/teams/<name>.yaml'));
+        } else {
+          console.log(chalk.bold(`  Teams (${teams.length}):`));
+          for (const t of teams) {
+            console.log(`    ${chalk.cyan(t.name)} ${chalk.gray(`[${t.agents.join(' → ')}]`)} ${chalk.gray(t.description)}`);
+          }
+        }
+        console.log('');
+        rl.prompt();
+        return;
+      }
+
+      case '/team': {
+        const teamName = parts[1];
+        const teamTask = parts.slice(2).join(' ');
+        if (!teamName || !teamTask) {
+          console.log(chalk.gray('  Usage: /team <name> <task...>'));
+          console.log('');
+          rl.prompt();
+          return;
+        }
+        const { TeamLoader: TeamLoaderT } = require('../src/plugins/team_loader');
+        const { AgentLoader: AgentLoaderT } = require('../src/plugins/agent_loader');
+        const { runTeam } = require('../src/plugins/team_runner');
+        const tloaderT = new TeamLoaderT(process.cwd());
+        const teamDef = tloaderT.get(teamName);
+        if (!teamDef) {
+          const valid = tloaderT.list().map(t => t.name);
+          console.log(chalk.red(`  Team "${teamName}" not found. Valid: ${valid.join(', ') || '(none)'}`));
+          console.log('');
+          rl.prompt();
+          return;
+        }
+        console.log(chalk.gray(`  Running team ${chalk.cyan(teamName)} (${teamDef.agents.join(' → ')})...`));
+        const agentLoaderT = new AgentLoaderT(process.cwd());
+        const teamCtx = { config, flags: {}, tui: require('./tui'), skillManager: null };
+        const teamResult = await runTeam(teamDef, teamTask, teamCtx, agentLoaderT);
+        console.log('');
+        console.log(teamResult.output || chalk.gray('(no output)'));
+        console.log('');
+        for (const pa of teamResult.perAgent) {
+          const err = pa.error ? chalk.red(` error=${pa.error}`) : '';
+          console.log(chalk.gray(`  ${pa.name}: steps=${pa.steps} tokens=${pa.tokens}${err}`));
+        }
+        console.log('');
+        rl.prompt();
+        return;
+      }
+
       case '/help':
         console.log('');
         console.log(chalk.bold('  Commands'));
@@ -884,6 +992,10 @@ module.exports = function createCommandHandler(config, conversationHistory, impr
         console.log(`  ${chalk.cyan('/budget')}        ${chalk.gray('Show context window budget')}`);
         console.log(`  ${chalk.cyan('/mcp')}           ${chalk.gray('Show connected MCP servers')}`);
         console.log(`  ${chalk.cyan('/skill')}         ${chalk.gray('Manage reusable skills')}`);
+        console.log(`  ${chalk.cyan('/agents')}        ${chalk.gray('List defined sub-agents')}`);
+        console.log(`  ${chalk.cyan('/agent')} <n> <t> ${chalk.gray('Run a sub-agent manually')}`);
+        console.log(`  ${chalk.cyan('/teams')}         ${chalk.gray('List defined agent teams')}`);
+        console.log(`  ${chalk.cyan('/team')} <n> <t>  ${chalk.gray('Run a team pipeline')}`);
         console.log(`  ${chalk.cyan('/evolve')}        ${chalk.gray('Propose a new skill from session friction (list|promote|log)')}`);
         console.log(`  ${chalk.cyan('/plugin')}        ${chalk.gray('List installed plugins')}`);
         console.log(`  ${chalk.cyan('/provider')}      ${chalk.gray('Configure LLM provider (interactive wizard)')}`);
