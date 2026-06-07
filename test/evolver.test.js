@@ -128,6 +128,19 @@ test('three near-identical prompts flag a repeated pattern', () => {
   assert.deepEqual(r.repeated_patterns[0].traceIds.sort(), ['a1', 'a2', 'a3']);
 });
 
+test('rephrased prompts with filler-word drift still cluster (field regression)', () => {
+  // Exact prompts from a real session that failed to cluster before
+  // stopword filtering: the third drops the names and adds filler.
+  const traces = [
+    trace('s1', 'generate a random seating chart for my classroom students Ana, Ben, Cara, Dan, Eli and Fay'),
+    trace('s2', 'generate a new random seating chart for the classroom students Ana, Ben, Cara, Dan, Eli and Fay'),
+    trace('s3', 'generate another random seating chart for my classroom students please'),
+  ];
+  const r = extractFrictionSignals(traces);
+  assert.equal(r.repeated_patterns.length, 1);
+  assert.equal(r.repeated_patterns[0].count, 3);
+});
+
 test('repeated pattern covered by an existing skill keyword is suppressed', () => {
   const traces = [
     trace('a1', 'convert this csv file to json format'),

@@ -13,9 +13,19 @@ const REPEAT_THRESHOLD = 3;
 const RETRY_THRESHOLD = 3;
 const SIMILARITY_THRESHOLD = 0.5;
 
+// Filler words carry no task identity but dilute Jaccard similarity —
+// "another seating chart please" must cluster with "a seating chart for..."
+const STOPWORDS = new Set([
+  'the', 'and', 'for', 'with', 'that', 'this', 'these', 'those', 'from',
+  'into', 'onto', 'please', 'can', 'you', 'could', 'would', 'will',
+  'another', 'again', 'new', 'now', 'just', 'some', 'all', 'any',
+  'make', 'give', 'get', 'want', 'need', 'like',
+]);
+
 function _wordSet(text) {
   return new Set(
-    String(text || '').toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length > 2)
+    String(text || '').toLowerCase().split(/[^a-z0-9]+/)
+      .filter(w => w.length > 2 && !STOPWORDS.has(w))
   );
 }
 
