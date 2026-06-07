@@ -228,25 +228,28 @@ function classifyToolCategory(message) {
  * @returns {string[]} tool names to include in the prompt
  */
 function getToolsForCategory(category) {
+  // use_skill rides along in every tool-bearing category — the skill index
+  // is injected on every turn, so the model must always be able to pull a
+  // skill body regardless of how the task was classified (~80 token cost).
   switch (category) {
     case 'code_intel':
-      return ['graph_search', 'explain_symbol', 'read_file', 'find_files', 'search', 'hybrid_search'];
+      return ['graph_search', 'explain_symbol', 'read_file', 'find_files', 'search', 'hybrid_search', 'use_skill'];
     case 'read':
-      return ['read_file', 'list_projects', 'graph_search', 'find_files', 'find_and_read'];
+      return ['read_file', 'list_projects', 'graph_search', 'find_files', 'find_and_read', 'use_skill'];
     case 'write':
-      return ['read_file', 'write_file', 'patch', 'bash', 'read_and_patch', 'create_and_run'];
+      return ['read_file', 'write_file', 'patch', 'bash', 'read_and_patch', 'create_and_run', 'use_skill'];
     case 'search':
-      return ['search', 'find_files', 'graph_search', 'read_file', 'explain_symbol', 'search_and_read', 'hybrid_search'];
+      return ['search', 'find_files', 'graph_search', 'read_file', 'explain_symbol', 'search_and_read', 'hybrid_search', 'use_skill'];
     case 'run':
-      return ['bash', 'run', 'read_file'];
+      return ['bash', 'run', 'read_file', 'use_skill'];
     case 'plan':
-      return ['read_file', 'write_file', 'patch', 'bash', 'search', 'find_files', 'graph_search', 'memory_load', 'memory_remember', 'bone_compile', 'bone_check', 'read_and_patch', 'create_and_run', 'find_and_read', 'search_and_read'];
+      return ['read_file', 'write_file', 'patch', 'bash', 'search', 'find_files', 'graph_search', 'memory_load', 'memory_remember', 'bone_compile', 'bone_check', 'read_and_patch', 'create_and_run', 'find_and_read', 'search_and_read', 'use_skill'];
     case 'web':
-      return ['web_search', 'web_fetch', 'read_file'];
+      return ['web_search', 'web_fetch', 'read_file', 'use_skill'];
     case 'respond':
       return []; // No tools needed for pure responses
     default:
-      return ['read_file', 'write_file', 'patch', 'bash', 'search'];
+      return ['read_file', 'write_file', 'patch', 'bash', 'search', 'use_skill'];
   }
 }
 
