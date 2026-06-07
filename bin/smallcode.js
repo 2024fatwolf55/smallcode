@@ -444,6 +444,7 @@ async function executeTool(name, args) {
     flags,
     config,
     tui,
+    skillManager,
   });
 
   try { if (dedup) dedup.record(name, args, result); } catch {}
@@ -2086,21 +2087,29 @@ function getMemoryContext(messages) {
   }
 }
 
-// Auto-load relevant skills based on the user's message
+// Auto-load relevant skills based on the user's message.
 // Fix #18: Cap skill injection to ~1000 tokens (4000 chars). Multiple matching
 // skills can each be a full .md file, quickly blowing up the system prompt.
+//
+// Lazy-skills: always inject the compact index (one line per skill, ~8 tokens each)
+// so the model can call use_skill to pull any body on demand. Auto-matched skill
+// bodies are appended after the index, subject to the 4000-char aggregate cap.
 function getSkillContext(messages) {
   if (!skillManager) return '';
   try {
+    const { formatSkillIndex } = require('../src/plugins/skill_index_formatter');
+    const index = skillManager.getIndex();
+    const indexStr = formatSkillIndex(index);
+
     const lastUser = [...messages].reverse().find(m => m.role === 'user');
-    if (!lastUser) return '';
-    const skills = skillManager.getAutoSkills(lastUser.content);
-    if (skills.length === 0) return '';
-    const formatted = skillManager.formatForPrompt(skills);
+    const autoSkills = lastUser ? skillManager.getAutoSkills(lastUser.content) : [];
+    const autoFormatted = skillManager.formatForPrompt(autoSkills);
+
+    const combined = indexStr + (autoFormatted ? '\n' + autoFormatted : '');
     // Hard cap: truncate if too long
-    return formatted.length > 4000
-      ? formatted.slice(0, 4000) + '\n... (skills truncated to fit context)'
-      : formatted;
+    return combined.length > 4000
+      ? combined.slice(0, 4000) + '\n... (skills truncated to fit context)'
+      : combined;
   } catch {
     return '';
   }
