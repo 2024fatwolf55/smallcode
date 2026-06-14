@@ -3120,17 +3120,23 @@ async function main() {
 
   skillManager = new SkillManager(process.cwd());
 
-  // Initialize MCP client (connect to external MCP servers)
+  // Initialize MCP client (connect to external MCP servers).
+  // Skipped entirely in --mcp server mode: an MCP server must not also act as
+  // an MCP host. Otherwise a self-referential `smallcode --mcp` entry in
+  // mcp.json makes each server spawn another server recursively — an unbounded
+  // fork bomb that exhausts RAM (issue #82).
   let mcpClient = null;
-  const mcpClientInstance = new MCPClient(process.cwd());
-  if (mcpClientInstance.loadConfig() > 0) {
-    mcpClient = mcpClientInstance;
-    // Connect asynchronously — don't block boot
-    mcpClient.connectAll().then(toolCount => {
-      if (toolCount > 0 && _fullscreenRef) {
-        _fullscreenRef.addTool('mcp-client', 'ok', `${toolCount} external tools from ${mcpClient.servers.size} servers`);
-      }
-    }).catch(() => {});
+  if (!flags.mcp) {
+    const mcpClientInstance = new MCPClient(process.cwd());
+    if (mcpClientInstance.loadConfig() > 0) {
+      mcpClient = mcpClientInstance;
+      // Connect asynchronously — don't block boot
+      mcpClient.connectAll().then(toolCount => {
+        if (toolCount > 0 && _fullscreenRef) {
+          _fullscreenRef.addTool('mcp-client', 'ok', `${toolCount} external tools from ${mcpClient.servers.size} servers`);
+        }
+      }).catch(() => {});
+    }
   }
 
   // Initialize session + token tracking
