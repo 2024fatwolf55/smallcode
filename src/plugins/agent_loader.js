@@ -32,8 +32,11 @@ class AgentLoader {
     return path.join(this.projectDir, '.smallcode', 'agents');
   }
 
-  _load() {
-    const dir = this._agentDir();
+  _bundledDir() {
+    return path.join(__dirname, '..', '..', 'agents');
+  }
+
+  _loadDir(dir) {
     if (!fs.existsSync(dir)) return;
     let entries;
     try {
@@ -48,6 +51,12 @@ class AgentLoader {
       if (!entry.name.endsWith('.md')) continue;
       this._ingest(path.join(dir, entry.name), entry.name.replace(/\.md$/i, ''));
     }
+  }
+
+  _load() {
+    // Bundled defaults first; project-level overrides (Map.set overwrites same name)
+    this._loadDir(this._bundledDir());
+    this._loadDir(this._agentDir());
   }
 
   _parseMeta(frontmatter) {

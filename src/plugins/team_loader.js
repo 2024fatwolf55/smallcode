@@ -28,6 +28,10 @@ class TeamLoader {
     return path.join(this.projectDir, '.smallcode', 'teams');
   }
 
+  _bundledDir() {
+    return path.join(__dirname, '..', '..', 'teams');
+  }
+
   _parseLine(line) {
     const m = line.trim().match(KV_RE);
     if (!m) return null;
@@ -50,8 +54,7 @@ class TeamLoader {
     return result;
   }
 
-  _load() {
-    const dir = this._teamDir();
+  _loadDir(dir) {
     if (!fs.existsSync(dir)) return;
     let entries;
     try {
@@ -76,6 +79,12 @@ class TeamLoader {
       team.path = filePath;
       this._teams.set(team.name, team);
     }
+  }
+
+  _load() {
+    // Bundled defaults first; project-level overrides (Map.set overwrites same name)
+    this._loadDir(this._bundledDir());
+    this._loadDir(this._teamDir());
   }
 
   list() {

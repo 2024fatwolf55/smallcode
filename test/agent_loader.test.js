@@ -24,10 +24,14 @@ function write(file, content) {
 
 // ── AgentLoader ───────────────────────────────────────────────────────────────
 
-test('AgentLoader: missing agents dir returns empty list', () => {
+test('AgentLoader: missing project agents dir still returns bundled defaults', () => {
   const dir = freshProject();
   const loader = new AgentLoader(dir);
-  assert.deepEqual(loader.list(), []);
+  // Bundled agents are always present; project dir is missing but that's fine
+  const names = loader.list().map(a => a.name);
+  assert.ok(names.includes('scout'), 'bundled scout should be present');
+  assert.ok(names.includes('code-engineer'), 'bundled code-engineer should be present');
+  // Unknown agent name still returns null
   assert.equal(loader.get('anything'), null);
 });
 
@@ -103,25 +107,33 @@ test('AgentLoader: drafts/ subdirectory is quarantined (never loaded)', () => {
   );
   const loader = new AgentLoader(dir);
   assert.equal(loader.get('draft-agent'), null, 'draft agent must not auto-load');
-  assert.equal(loader.list().length, 0);
+  // Only bundled defaults present — no project agents aside from the quarantined draft
+  const names = loader.list().map(a => a.name);
+  assert.ok(!names.includes('draft-agent'), 'draft-agent must not appear in list');
 });
 
-test('AgentLoader: multiple agents coexist', () => {
+test('AgentLoader: multiple agents coexist and project agents are accessible', () => {
   const dir = freshProject();
   write(path.join(dir, '.smallcode', 'agents', 'a.md'), '---\nname: alpha\ntools: [read_file]\n---\nbody a\n');
   write(path.join(dir, '.smallcode', 'agents', 'b.md'), '---\nname: beta\ntools: [bash]\n---\nbody b\n');
   const loader = new AgentLoader(dir);
-  assert.equal(loader.list().length, 2);
-  assert.ok(loader.get('alpha'));
-  assert.ok(loader.get('beta'));
+  // Both project-defined agents must be present (bundled defaults are also loaded)
+  assert.ok(loader.get('alpha'), 'alpha must be present');
+  assert.ok(loader.get('beta'), 'beta must be present');
+  // Total count is project agents + bundled defaults (at least 2 project)
+  assert.ok(loader.list().length >= 2, 'should have at least the two project agents');
 });
 
 // ── TeamLoader ────────────────────────────────────────────────────────────────
 
-test('TeamLoader: missing teams dir returns empty list', () => {
+test('TeamLoader: missing project teams dir still returns bundled defaults', () => {
   const dir = freshProject();
   const loader = new TeamLoader(dir);
-  assert.deepEqual(loader.list(), []);
+  // Bundled teams are always present; project dir is missing but that's fine
+  const names = loader.list().map(t => t.name);
+  assert.ok(names.includes('build'), 'bundled build team should be present');
+  assert.ok(names.includes('debug'), 'bundled debug team should be present');
+  // Unknown team name still returns null
   assert.equal(loader.get('anything'), null);
 });
 
