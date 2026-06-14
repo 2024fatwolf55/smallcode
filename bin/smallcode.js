@@ -287,6 +287,7 @@ async function runTUI(config) {
       onCommand: async (cmd) => {
         if (cmd === '/quit' || cmd === '/q' || cmd === '/exit') {
           if (sessionStore) sessionStore.save(conversationHistory, { tokens: tokenTracker ? tokenTracker.stats() : undefined });
+          try { if (memoryStore) { const { runHygiene } = require('../src/memory/hygiene'); runHygiene(memoryStore); } } catch {}
           screen.leave();
           killMCP()
           process.exit(0);
@@ -318,6 +319,7 @@ async function runTUI(config) {
         if (sessionStore) {
           sessionStore.save(conversationHistory, { tokens: tokenTracker ? tokenTracker.stats() : undefined });
         }
+        try { if (memoryStore) { const { runHygiene } = require('../src/memory/hygiene'); runHygiene(memoryStore); } } catch {}
         killMCP()
         process.exit(0);
       },
@@ -2555,6 +2557,7 @@ async function chatCompletion(config, messages) {
       });
       sessionStore.autoTitle(conversationHistory);
     }
+    try { if (memoryStore) { const { runHygiene } = require('../src/memory/hygiene'); runHygiene(memoryStore); } } catch {}
 
     return data;
   } catch (err) {

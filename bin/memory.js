@@ -20,7 +20,7 @@ const INDEX_FILE = '.smallcode/memory/index.json';
 // ─── Memory Object ───────────────────────────────────────────────────────────
 
 class MemoryObject {
-  constructor({ id, type, title, content, tags, relations, createdAt, updatedAt, source }) {
+  constructor({ id, type, title, content, tags, relations, createdAt, updatedAt, source, tier, last_used_at }) {
     this.id = id || crypto.randomUUID().slice(0, 8);
     this.type = type; // decision | workflow | gotcha | convention | context | source
     this.title = title;
@@ -30,6 +30,8 @@ class MemoryObject {
     this.createdAt = createdAt || new Date().toISOString();
     this.updatedAt = updatedAt || new Date().toISOString();
     this.source = source || null; // { file, line, commit }
+    this.tier = tier || 'hot'; // hot | archive
+    this.last_used_at = last_used_at || this.createdAt;
   }
 
   toJSON() {
@@ -37,6 +39,7 @@ class MemoryObject {
       id: this.id, type: this.type, title: this.title, content: this.content,
       tags: this.tags, relations: this.relations,
       createdAt: this.createdAt, updatedAt: this.updatedAt, source: this.source,
+      tier: this.tier, last_used_at: this.last_used_at,
     };
   }
 }
