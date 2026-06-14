@@ -21,6 +21,10 @@
 // previously skipped silently (closes #81). README-style files are ignored.
 //
 // Frontmatter accepts both LF and CRLF line endings (closes #52).
+//
+// Lazy loading: index entries (frontmatter only) are stored in _index Map.
+// Bodies are loaded on demand via _loadBody(name) and cached into skills Map.
+// getIndex() returns flat IndexEntry list for prompt injection.
 
 const fs = require('fs');
 const path = require('path');
@@ -31,10 +35,16 @@ const KV_RE = /^(\w+)\s*:\s*(.+?)\s*$/;
 // Docs that live alongside skills but aren't skills themselves
 const NON_SKILL_MD = /^(readme|changelog|license|contributing)\.md$/i;
 
+// Max bytes to scan for frontmatter before falling back to full read.
+const FRONTMATTER_SCAN_BYTES = 2048;
+// Max lines to scan for frontmatter end marker.
+const FRONTMATTER_SCAN_LINES = 50;
+
 class SkillManager {
   constructor(projectDir) {
     this.projectDir = projectDir || process.cwd();
-    this.skills = new Map(); // name → skill object
+    this.skills = new Map(); // name → fully-loaded skill object (cached)
+    this._index = new Map(); // name → IndexEntry (frontmatter + path, no body)
     this._load();
   }
 
@@ -130,87 +140,191 @@ class SkillManager {
     this._ingestFile(skillFile, path.basename(skillFile), skillDir, name, 'nested');
   }
 
-  _ingestFile(filePath, filename, dir, defaultName, origin) {
-    let content;
+  // Read only enough of the file to extract frontmatter (index-only load).
+  // Returns { frontmatter: string|null, bodyStart: number } — bodyStart is
+  // the byte offset where the body begins (after the closing ---).
+  // Falls back to a full read when the file is small enough or frontmatter
+  // spans more than FRONTMATTER_SCAN_BYTES.
+  _readFrontmatterOnly(filePath) {
     try {
-      content = fs.readFileSync(filePath, 'utf-8');
+      // Read a limited slice first.
+      const fd = fs.openSync(filePath, 'r');
+      const buf = Buffer.alloc(FRONTMATTER_SCAN_BYTES);
+      const bytesRead = fs.readSync(fd, buf, 0, FRONTMATTER_SCAN_BYTES, 0);
+      fs.closeSync(fd);
+      const chunk = buf.slice(0, bytesRead).toString('utf-8');
+
+      if (!chunk.startsWith('---')) {
+        // No frontmatter — full content is body; return null so caller full-reads.
+        return { frontmatter: null, hasMore: bytesRead === FRONTMATTER_SCAN_BYTES };
+      }
+
+      // Find closing --- within FRONTMATTER_SCAN_LINES lines
+      const lines = chunk.split(/\r?\n/);
+      let closeIdx = -1;
+      for (let i = 1; i < Math.min(lines.length, FRONTMATTER_SCAN_LINES); i++) {
+        if (lines[i].trimEnd() === '---') { closeIdx = i; break; }
+      }
+      if (closeIdx === -1) {
+        // Frontmatter not closed within scan window — fall back to full read.
+        return { frontmatter: null, hasMore: true };
+      }
+
+      const frontmatter = lines.slice(1, closeIdx).join('\n');
+      return { frontmatter, hasMore: bytesRead === FRONTMATTER_SCAN_BYTES };
     } catch {
-      return;
+      return { frontmatter: null, hasMore: false };
     }
-    const skill = this._parse(content, filename, dir, defaultName, origin);
-    if (skill) this.skills.set(skill.name, skill);
   }
 
-  _parse(content, filename, dir, defaultName, origin) {
-    // Parse YAML frontmatter (CRLF + LF tolerant — closes #52)
-    const fmMatch = content.match(FM_RE);
-    let frontmatter = '';
-    let body = content;
+  _ingestFile(filePath, filename, dir, defaultName, origin) {
+    // Index-only path: read frontmatter cheaply, store as index entry.
+    // Body is loaded lazily on first get().
+    const { frontmatter, hasMore } = this._readFrontmatterOnly(filePath);
 
-    if (fmMatch) {
-      frontmatter = fmMatch[1];
-      body = fmMatch[2];
-    } else if (!defaultName) {
-      // Files without frontmatter and no derivable name aren't skills.
-      // Flat + nested loaders always pass a defaultName, so frontmatter-less
-      // files load as manual skills (closes #81); README-style files are
-      // filtered by name in _loadFlat.
+    let meta = {};
+    if (frontmatter !== null) {
+      meta = this._parseMeta(frontmatter);
+    }
+
+    const name = meta.name || defaultName || filename.replace(/\.md$/i, '');
+
+    const entry = {
+      name,
+      trigger: meta.trigger || 'manual',
+      keywords: Array.isArray(meta.keywords) ? meta.keywords : [],
+      description: meta.description || '',
+      tags: Array.isArray(meta.tags) ? meta.tags : [],
+      related: Array.isArray(meta.related) ? meta.related : [],
+      path: filePath,
+      origin: origin || (defaultName ? 'nested' : 'flat'),
+      // hasFrontmatter: whether the file had a --- block
+      _hasFrontmatter: frontmatter !== null,
+      // If the file fits in our scan and has frontmatter, we know
+      // the body wasn't loaded yet. Track that.
+      _bodyLoaded: false,
+    };
+
+    this._index.set(name, entry);
+    // Remove any stale cached body for same name (precedence override)
+    this.skills.delete(name);
+  }
+
+  _parseMeta(frontmatter) {
+    const meta = {};
+    for (const rawLine of frontmatter.split(/\r?\n/)) {
+      const m = rawLine.match(KV_RE);
+      if (!m) continue;
+      let value = m[2].trim();
+      if (value.startsWith('[') && value.endsWith(']')) {
+        value = value.slice(1, -1).split(',').map(s => s.trim().replace(/['"]/g, '')).filter(Boolean);
+      }
+      meta[m[1]] = value;
+    }
+    return meta;
+  }
+
+  // Load the full body for a named skill, populate this.skills cache.
+  _loadBody(name) {
+    const entry = this._index.get(name);
+    if (!entry) return null;
+    if (entry._bodyLoaded && this.skills.has(name)) return this.skills.get(name);
+
+    let content;
+    try {
+      content = fs.readFileSync(entry.path, 'utf-8');
+    } catch {
       return null;
     }
 
-    // Tiny YAML parser — no dep needed
-    const meta = {};
-    if (frontmatter) {
-      for (const rawLine of frontmatter.split(/\r?\n/)) {
-        const m = rawLine.match(KV_RE);
-        if (!m) continue;
-        let value = m[2].trim();
-        if (value.startsWith('[') && value.endsWith(']')) {
-          value = value.slice(1, -1).split(',').map(s => s.trim().replace(/['"]/g, '')).filter(Boolean);
-        }
-        meta[m[1]] = value;
-      }
+    const fmMatch = content.match(FM_RE);
+    let body = content;
+    let meta = {};
+
+    if (fmMatch) {
+      meta = this._parseMeta(fmMatch[1]);
+      body = fmMatch[2];
+    } else if (!entry._hasFrontmatter) {
+      // No frontmatter — full file is body (manual trigger, named by filename/dir)
+      body = content;
     }
 
-    return {
-      name: meta.name || defaultName || filename.replace(/\.md$/i, ''),
-      trigger: meta.trigger || 'manual',
-      keywords: Array.isArray(meta.keywords) ? meta.keywords : [],
+    const skill = {
+      name: meta.name || entry.name,
+      trigger: meta.trigger || entry.trigger,
+      keywords: Array.isArray(meta.keywords) ? meta.keywords : entry.keywords,
+      description: meta.description || entry.description || '',
+      tags: Array.isArray(meta.tags) ? meta.tags : entry.tags,
+      related: Array.isArray(meta.related) ? meta.related : entry.related,
       content: body.trim(),
-      path: path.join(dir, filename),
-      origin: origin || (defaultName ? 'nested' : 'flat'),
+      path: entry.path,
+      origin: entry.origin,
     };
+
+    entry._bodyLoaded = true;
+    this.skills.set(name, skill);
+    return skill;
   }
 
-  // Get all skills
+  // Get all skills — returns index entries with lazy-loaded bodies for callers
+  // that need content. list() does NOT load bodies (index only).
   list() {
-    return [...this.skills.values()].map(s => ({
-      name: s.name,
-      trigger: s.trigger,
-      keywords: s.keywords,
-      preview: s.content.slice(0, 80) + (s.content.length > 80 ? '...' : ''),
-      origin: s.origin || 'flat',
+    return [...this._index.values()].map(e => ({
+      name: e.name,
+      trigger: e.trigger,
+      keywords: e.keywords,
+      preview: this._getPreview(e),
+      origin: e.origin || 'flat',
     }));
   }
 
-  // Get a skill by name
-  get(name) {
-    return this.skills.get(name) || null;
+  _getPreview(entry) {
+    // Return preview from cached body if available; otherwise a short placeholder.
+    if (entry._bodyLoaded && this.skills.has(entry.name)) {
+      const body = this.skills.get(entry.name).content;
+      return body.slice(0, 80) + (body.length > 80 ? '...' : '');
+    }
+    // Avoid loading body just for list() — return description or empty
+    return entry.description || '';
   }
 
-  // Get skills that should auto-inject for a given message
+  // Get a skill by name — lazily loads body on first call.
+  get(name) {
+    if (this.skills.has(name)) return this.skills.get(name);
+    if (!this._index.has(name)) return null;
+    return this._loadBody(name);
+  }
+
+  // Get skills that should auto-inject for a given message.
+  // Only checks index entries (trigger/keywords) — avoids loading bodies
+  // until caller needs content.
   getAutoSkills(message) {
     const msg = (message || '').toLowerCase();
     const results = [];
-    for (const skill of this.skills.values()) {
-      if (skill.trigger === 'auto') {
-        results.push(skill);
-      } else if (skill.trigger === 'match' && skill.keywords.length > 0) {
-        const match = skill.keywords.some(kw => msg.includes(String(kw).toLowerCase()));
-        if (match) results.push(skill);
+    for (const entry of this._index.values()) {
+      if (entry.trigger === 'auto') {
+        results.push(this._loadBody(entry.name));
+      } else if (entry.trigger === 'match' && entry.keywords.length > 0) {
+        const match = entry.keywords.some(kw => msg.includes(String(kw).toLowerCase()));
+        if (match) results.push(this._loadBody(entry.name));
       }
     }
-    return results;
+    return results.filter(Boolean);
+  }
+
+  // Return flat IndexEntry list for prompt injection (no bodies loaded).
+  // { name, description, trigger, keywords, tags, related, path, origin }
+  getIndex() {
+    return [...this._index.values()].map(e => ({
+      name: e.name,
+      description: e.description,
+      trigger: e.trigger,
+      keywords: e.keywords,
+      tags: e.tags,
+      related: e.related,
+      path: e.path,
+      origin: e.origin,
+    }));
   }
 
   // Create a new skill in the project's .smallcode/skills directory
@@ -239,10 +353,16 @@ class SkillManager {
       name,
       trigger,
       keywords,
+      description: options.description || '',
+      tags: options.tags || [],
+      related: options.related || [],
       content,
       path: filePath,
       origin: 'flat',
+      _hasFrontmatter: true,
+      _bodyLoaded: true,
     };
+    this._index.set(name, skill);
     this.skills.set(name, skill);
     return skill;
   }
@@ -276,11 +396,12 @@ class SkillManager {
 
   // Remove a skill
   remove(name) {
-    const skill = this.skills.get(name);
-    if (!skill) return false;
-    if (fs.existsSync(skill.path)) {
-      try { fs.unlinkSync(skill.path); } catch {}
+    const entry = this._index.get(name) || this.skills.get(name);
+    if (!entry) return false;
+    if (fs.existsSync(entry.path)) {
+      try { fs.unlinkSync(entry.path); } catch {}
     }
+    this._index.delete(name);
     this.skills.delete(name);
     return true;
   }

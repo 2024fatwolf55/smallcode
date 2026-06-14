@@ -840,6 +840,24 @@ async function executeTool(name, args, ctx) {
       return { result: '' };
     }
 
+    case 'use_skill': {
+      const skillManager = ctx.skillManager || null;
+      if (!skillManager) return { error: 'use_skill: skill system not available' };
+      const skillName = String(args.name || '').trim();
+      if (!skillName) return { error: 'use_skill: name is required' };
+      const skill = skillManager.get(skillName);
+      if (!skill) {
+        const validNames = skillManager.getIndex().map(e => e.name).slice(0, 10);
+        return { error: `use_skill: skill "${skillName}" not found. Valid names: ${validNames.join(', ')}` };
+      }
+      const { formatSkillResult } = require('../src/plugins/skill_index_formatter');
+      const index = skillManager.getIndex();
+      const relatedEntries = (skill.related || [])
+        .map(r => index.find(e => e.name === r))
+        .filter(Boolean);
+      return { result: formatSkillResult(skill, relatedEntries) };
+    }
+
     case 'bone_compile': {
       const safe = safeResolvePath(args.path, cwd);
       if (!safe.ok) return { error: `bone_compile rejected: ${safe.reason}` };
