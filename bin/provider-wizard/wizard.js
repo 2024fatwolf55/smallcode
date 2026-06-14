@@ -70,6 +70,28 @@ async function validateApiKey(provider, apiKey, baseUrl) {
   }
 }
 
+// List models from an OpenAI-compatible /models endpoint. Used to offer a
+// picker for local providers (Ollama, LM Studio) where the installed models
+// are knowable. Returns [] on any failure — caller falls back to free text.
+async function fetchModels(baseUrl, apiKey) {
+  const url = (baseUrl || '').replace(/\/+$/, '');
+  if (!url) return [];
+  try {
+    const headers = apiKey ? { 'Authorization': `Bearer ${apiKey}` } : {};
+    const res = await fetch(`${url}/models`, {
+      headers,
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (Array.isArray(data.data) ? data.data : [])
+      .map(m => m && m.id)
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
 function mergeEnvFile(filePath, newVars) {
   let lines = [];
   try {
@@ -118,8 +140,11 @@ async function runWizard(options = {}) {
   // Load existing env
   const existingEnv = parseEnvFile(envPath);
 
-  let rl = null;
-  if (isInteractive) {
+  // Borrow the caller's readline when available — creating a second interface
+  // on the same stdin makes both echo every keystroke (duplicated letters).
+  const borrowedRl = options.rl && typeof options.rl.question === 'function' ? options.rl : null;
+  let rl = borrowedRl;
+  if (isInteractive && !rl) {
     rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
@@ -212,7 +237,23 @@ async function runWizard(options = {}) {
     };
     let model = options.model || '';
     if (!model && isInteractive) {
-      model = await ask(rl, '  Model name', defaultModels[provider] || '');
+      // Local providers: list installed models so the user can pick instead
+      // of typing the exact name. Falls back to free text if the server is
+      // unreachable or the list is empty.
+      if (!providerInfo.keyEnv) {
+        process.stdout.write(`  Fetching models from ${baseUrl}...`);
+        const models = await fetchModels(baseUrl, apiKey);
+        if (models.length) {
+          console.log(` \x1b[32m${models.length} found\x1b[0m`);
+          const idx = await askNumber(rl, '  Select a model:', models);
+          if (idx >= 0) model = models[idx];
+        } else {
+          console.log(' \x1b[33mnone found — enter manually\x1b[0m');
+        }
+      }
+      if (!model) {
+        model = await ask(rl, '  Model name', defaultModels[provider] || '');
+      }
     }
     model = model || defaultModels[provider] || '';
 
@@ -334,8 +375,8 @@ async function runWizard(options = {}) {
     return result;
 
   } finally {
-    if (rl) rl.close();
+    if (rl && !borrowedRl) rl.close();
   }
 }
 
-module.exports = { runWizard, ask, askNumber, askYesNo, validateApiKey, mergeEnvFile };
+module.exports = { runWizard, ask, askNumber, askYesNo, validateApiKey, mergeEnvFile, fetchModels };

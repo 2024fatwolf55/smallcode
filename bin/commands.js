@@ -870,7 +870,7 @@ module.exports = function createCommandHandler(config, conversationHistory, impr
           console.log(pProviderStatus());
         } else {
           const pWizard = require('./provider-wizard/wizard');
-          const result = await pWizard.runWizard({ interactive: true });
+          const result = await pWizard.runWizard({ interactive: true, rl });
           if (result.success) {
             console.log(result.provider || '');
           }
