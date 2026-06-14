@@ -139,6 +139,9 @@ let _fullscreenRef = null;
 // console.log override (runTUI) — module-scoped so both closures share it.
 const { getLiveSettings } = require('./live_settings');
 let _activeToolHandle = null;
+// True when the current turn's assistant content was already shown live via
+// streamToken, so the post-turn addChat('assistant') must not render it again.
+let _contentStreamed = false;
 
 // One-line summary of a tool's most salient argument, for the live ⚙ line.
 function summarizeToolArgs(name, args) {
@@ -665,7 +668,7 @@ async function runAgentLoop(userMessage, config) {
     if (message?.content) {
       conversationHistory.push({ role: 'assistant', content: message.content });
       if (_fullscreenRef) {
-        _fullscreenRef.addChat('assistant', message.content);
+        if (!_contentStreamed) _fullscreenRef.addChat('assistant', message.content);
       } else {
         process.stdout.write(tui.renderMarkdown(message.content));
       }
@@ -1902,9 +1905,9 @@ Read the FULL file above carefully. Fix ALL errors. Use the patch tool with the 
           }
         }
       } catch {}
-      // Render with markdown highlighting
+      // Render with markdown highlighting (skip if already shown live — #77)
       if (_fullscreenRef) {
-        _fullscreenRef.addChat('assistant', message.content);
+        if (!_contentStreamed) _fullscreenRef.addChat('assistant', message.content);
       } else {
         process.stdout.write(tui.renderMarkdown(message.content));
       }
@@ -2523,6 +2526,15 @@ async function chatCompletion(config, messages) {
       }
     }
 
+    // Live streaming (issue #77, Phase B): opt-in via /live stream. Only when a
+    // fullscreen TUI is attached to receive tokens. Request usage in the final
+    // chunk so the context meter still updates.
+    const wantStream = !!(_fullscreenRef && getLiveSettings().stream);
+    if (wantStream) {
+      body.stream = true;
+      body.stream_options = { include_usage: true };
+    }
+
     let response;
     try {
       response = await fetch(`${baseUrl}/chat/completions`, {
@@ -2574,7 +2586,8 @@ async function chatCompletion(config, messages) {
           const retry = await fetch(`${baseUrl}/chat/completions`, {
             method: 'POST',
             headers,
-            body: JSON.stringify(body),
+            // Retry non-streamed so the JSON parse below is unambiguous.
+            body: JSON.stringify({ ...body, stream: false, stream_options: undefined }),
           });
           if (retry.ok) return await retry.json();
         } catch {}
@@ -2587,7 +2600,42 @@ async function chatCompletion(config, messages) {
       return null;
     }
 
-    const data = await response.json();
+    // Consume the response. When streaming (Phase B), assemble the SSE deltas
+    // back into the same `data` shape the non-streaming path produces, driving
+    // the live chat/thinking views as tokens arrive. On any streaming failure,
+    // fall back to whatever was assembled so far. The non-streaming path is
+    // unchanged.
+    let data;
+    if (wantStream && response.body && typeof response.body.getReader === 'function') {
+      const { StreamAssembler, parseSSEBuffer } = require('./stream_assembler');
+      const assembler = new StreamAssembler();
+      const showThinking = getLiveSettings().thinking;
+      try {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const { events, rest } = parseSSEBuffer(buf);
+          buf = rest;
+          for (const ev of events) {
+            if (ev.done || !ev.json) continue;
+            assembler.pushChunk(ev.json, {
+              onContent: (t) => { if (_fullscreenRef) _fullscreenRef.streamToken(t); },
+              onReasoning: showThinking ? (t) => { if (_fullscreenRef) _fullscreenRef.streamThinking(t); } : undefined,
+            });
+          }
+        }
+      } catch { /* fall through with whatever assembled so far */ }
+      if (_fullscreenRef) _fullscreenRef.endStream();
+      data = assembler.toData();
+      _contentStreamed = !!(_fullscreenRef && assembler.content);
+    } else {
+      data = await response.json();
+      _contentStreamed = false;
+    }
 
     // Length-truncation recovery: reasoning models served via LM Studio
     // (lfm2.x, Qwen3, DeepSeek R1) expose a separate `reasoning_content`

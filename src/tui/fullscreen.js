@@ -1304,8 +1304,27 @@ class FullScreenTUI {
     this.render();
   }
 
+  // Live dimmed reasoning preview (issue #77, Phase B). Streams thinking tokens
+  // into a single collapsing dimmed line so the user can watch the model reason
+  // without flooding the chat. Reset by endStream() at turn boundaries.
+  streamThinking(token) {
+    const dim = '\x1b[2m';
+    const prefix = '        ' + this.theme.border + '│ ' + ANSI.reset + dim + '[thinking] ';
+    if (this._thinkingLineIdx == null || this._thinkingLineIdx >= this.chatLines.length) {
+      this._thinkingLineIdx = this.chatLines.length;
+      this._thinkingText = '';
+      this.chatLines.push(prefix + ANSI.reset);
+    }
+    this._thinkingText += token;
+    const tail = this._thinkingText.replace(/\s+/g, ' ').trim().slice(-120);
+    this.chatLines[this._thinkingLineIdx] = prefix + tail + ANSI.reset;
+    this.chatScroll = 0;
+    this.render();
+  }
+
   endStream() {
     this._lastLineIsStreaming = false;
+    this._thinkingLineIdx = null;
     this.chatLines.push('');
     this.render();
   }
