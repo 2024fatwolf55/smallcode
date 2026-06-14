@@ -302,8 +302,24 @@ async function runTUI(config) {
         console.log = (...args) => { captured += args.join(' ') + '\n'; };
         // Create a mock rl for command handler
         const mockRl = { prompt: () => {}, close: () => { screen.leave(); process.exit(0); } };
+        // /provider's interactive wizard needs a real stdin/stdout, which the
+        // fullscreen TUI captures — so it silently did nothing (issue #80).
+        // Inside the TUI, surface the current provider/model status instead and
+        // point the user at the paths that DO work here (/endpoint, /model) or
+        // the shell wizard.
+        const provMatch = /^\/provider\b/.test(cmd);
+        const provSub = cmd.replace(/^\/provider\s*/, '').trim();
         try {
-          await handleCmd(cmd, mockRl);
+          if (provMatch && provSub !== 'status' && provSub !== '--status' && provSub !== '-s') {
+            await handleCmd('/provider status', mockRl);
+            captured += '\n  The interactive provider wizard needs a real terminal and';
+            captured += '\n  cannot run inside the full-screen TUI. To reconfigure:';
+            captured += '\n    • /endpoint  — switch the API base URL here';
+            captured += '\n    • /model     — switch the model here';
+            captured += '\n    • run `smallcode /provider` from your shell for the full wizard';
+          } else {
+            await handleCmd(cmd, mockRl);
+          }
         } catch (e) {
           captured += `Error: ${e.message}\n`;
         }

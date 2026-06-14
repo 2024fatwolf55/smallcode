@@ -54,6 +54,22 @@ function visualCursorPosition(str, cursorIdx, maxVisualWidth) {
   return { line, col };
 }
 
+// Word-boundary helpers for input editing (issue #93). A "word" is a run of
+// non-whitespace characters. Movement skips any whitespace adjacent to the
+// cursor before scanning over the word, mirroring readline/Windows behaviour.
+function prevWordBoundary(str, idx) {
+  let i = idx;
+  while (i > 0 && /\s/.test(str[i - 1])) i--;        // skip whitespace to the left
+  while (i > 0 && !/\s/.test(str[i - 1])) i--;        // skip the word itself
+  return i;
+}
+function nextWordBoundary(str, idx) {
+  let i = idx;
+  while (i < str.length && /\s/.test(str[i])) i++;    // skip whitespace to the right
+  while (i < str.length && !/\s/.test(str[i])) i++;   // skip the word itself
+  return i;
+}
+
 // ─── ANSI Escape Sequences ───────────────────────────────────────────────────
 
 const ESC = '\x1b[';
@@ -182,6 +198,7 @@ class FullScreenTUI {
       { cmd: '/quit', alias: '/q', desc: 'Exit SmallCode' },
       { cmd: '/clear', alias: null, desc: 'Reset conversation' },
       { cmd: '/model', alias: null, desc: 'Show/switch model' },
+      { cmd: '/provider', alias: null, desc: 'Show provider / configure model' },
       { cmd: '/endpoint', alias: null, desc: 'Switch API endpoint' },
       { cmd: '/stats', alias: null, desc: 'Session statistics' },
       { cmd: '/tokens', alias: null, desc: 'Token usage report' },
@@ -891,6 +908,60 @@ class FullScreenTUI {
       return;
     }
 
+    // ─── Line / word navigation (issue #93) ──────────────────────────────
+    // Home / Ctrl+A — start of line. Terminals send Home as \x1b[H, \x1b[1~,
+    // or \x1bOH depending on mode; Ctrl+A arrives as the raw byte \x01.
+    if (key === '\x1b[H' || key === '\x1b[1~' || key === '\x1bOH' || key === '\x01') {
+      this.inputCursor = 0;
+      this.render();
+      return;
+    }
+    // End / Ctrl+E — end of line (\x1b[F, \x1b[4~, \x1bOF, or Ctrl+E = \x05).
+    if (key === '\x1b[F' || key === '\x1b[4~' || key === '\x1bOF' || key === '\x05') {
+      this.inputCursor = this.inputBuffer.length;
+      this.render();
+      return;
+    }
+    // Ctrl+Left — previous word (\x1b[1;5D, and Alt+B = \x1bb as a fallback).
+    if (key === '\x1b[1;5D' || key === '\x1b[1;3D' || key === '\x1bb') {
+      this.inputCursor = prevWordBoundary(this.inputBuffer, this.inputCursor);
+      this.render();
+      return;
+    }
+    // Ctrl+Right — next word (\x1b[1;5C, and Alt+F = \x1bf as a fallback).
+    if (key === '\x1b[1;5C' || key === '\x1b[1;3C' || key === '\x1bf') {
+      this.inputCursor = nextWordBoundary(this.inputBuffer, this.inputCursor);
+      this.render();
+      return;
+    }
+    // Ctrl+Backspace / Ctrl+W — delete the word to the left of the cursor.
+    // Ctrl+Backspace reaches us as \x17 (Ctrl+W) or \x1b\x7f on many terminals.
+    if (key === '\x17' || key === '\x1b\x7f' || key === '\x1b\b') {
+      const start = prevWordBoundary(this.inputBuffer, this.inputCursor);
+      this.inputBuffer = this.inputBuffer.slice(0, start) + this.inputBuffer.slice(this.inputCursor);
+      this.inputCursor = start;
+      this.commandPaletteOpen = this.inputBuffer.startsWith('/');
+      this.render();
+      return;
+    }
+    // Ctrl+Delete — delete the word to the right of the cursor (\x1b[3;5~).
+    if (key === '\x1b[3;5~' || key === '\x1b[3;3~') {
+      const end = nextWordBoundary(this.inputBuffer, this.inputCursor);
+      this.inputBuffer = this.inputBuffer.slice(0, this.inputCursor) + this.inputBuffer.slice(end);
+      this.commandPaletteOpen = this.inputBuffer.startsWith('/');
+      this.render();
+      return;
+    }
+    // Delete (forward) — remove the character under the cursor (\x1b[3~).
+    if (key === '\x1b[3~') {
+      if (this.inputCursor < this.inputBuffer.length) {
+        this.inputBuffer = this.inputBuffer.slice(0, this.inputCursor) + this.inputBuffer.slice(this.inputCursor + 1);
+        this.commandPaletteOpen = this.inputBuffer.startsWith('/');
+      }
+      this.render();
+      return;
+    }
+
     // Scroll chat — PgUp/PgDn, Shift+Up/Down, mouse wheel
     if (key === '\x1b[5~' || key === '\x1b[1;2A') { // PgUp or Shift+Up
       const maxBack = -(Math.max(0, this.chatLines.length - this.chatHeight));
@@ -917,6 +988,15 @@ class FullScreenTUI {
       this.render();
       return;
     }
+    // Right-click — paste from clipboard (issue #96). Enabling SGR mouse
+    // tracking makes the terminal forward right-clicks to us instead of
+    // showing its native paste menu, so we honour the gesture ourselves.
+    // SGR button 2 (right) press is "\x1b[<2;X;YM", release "\x1b[<2;X;Ym".
+    if (/^\x1b\[<2;\d+;\d+m$/.test(key)) {
+      this._pasteFromClipboard();
+      return;
+    }
+
     // Mouse press / drag / release (SGR) — text selection in the chat panel.
     // Only the chat region selects; tool panel and input area are ignored.
     if (key.includes('\x1b[<')) {
@@ -929,27 +1009,9 @@ class FullScreenTUI {
       return;
     }
 
-    // Ctrl+V — paste from clipboard (Windows)
+    // Ctrl+V — paste from clipboard (issue #96: right-click also routes here)
     if (key === '\x16') {
-      try {
-        const { execSync } = require('child_process');
-        let clipboard = '';
-        if (process.platform === 'win32') {
-          clipboard = execSync('powershell -command "Get-Clipboard"', { encoding: 'utf-8', timeout: 3000 }).trim();
-        } else if (process.platform === 'darwin') {
-          clipboard = execSync('pbpaste', { encoding: 'utf-8', timeout: 3000 }).trim();
-        } else {
-          clipboard = execSync('xclip -selection clipboard -o 2>/dev/null || xsel --clipboard --output 2>/dev/null', { encoding: 'utf-8', timeout: 3000, shell: true }).trim();
-        }
-        if (clipboard) {
-          // Replace newlines with spaces for input line
-          const text = clipboard.replace(/[\r\n]+/g, ' ');
-          this.inputBuffer = this.inputBuffer.slice(0, this.inputCursor) + text + this.inputBuffer.slice(this.inputCursor);
-          this.inputCursor += text.length;
-          this.commandPaletteOpen = this.inputBuffer.startsWith('/');
-          this.render();
-        }
-      } catch {}
+      this._pasteFromClipboard();
       return;
     }
 
@@ -974,6 +1036,30 @@ class FullScreenTUI {
         this.render();
       }
     }
+  }
+
+  // Insert clipboard contents at the cursor. Shared by Ctrl+V and the
+  // right-click gesture (issue #96). Newlines collapse to spaces so the
+  // single-line input stays intact.
+  _pasteFromClipboard() {
+    try {
+      const { execSync } = require('child_process');
+      let clipboard = '';
+      if (process.platform === 'win32') {
+        clipboard = execSync('powershell -command "Get-Clipboard"', { encoding: 'utf-8', timeout: 3000 }).trim();
+      } else if (process.platform === 'darwin') {
+        clipboard = execSync('pbpaste', { encoding: 'utf-8', timeout: 3000 }).trim();
+      } else {
+        clipboard = execSync('xclip -selection clipboard -o 2>/dev/null || xsel --clipboard --output 2>/dev/null', { encoding: 'utf-8', timeout: 3000, shell: true }).trim();
+      }
+      if (clipboard) {
+        const text = clipboard.replace(/[\r\n]+/g, ' ');
+        this.inputBuffer = this.inputBuffer.slice(0, this.inputCursor) + text + this.inputBuffer.slice(this.inputCursor);
+        this.inputCursor += text.length;
+        this.commandPaletteOpen = this.inputBuffer.startsWith('/');
+        this.render();
+      }
+    } catch {}
   }
 
   _onResize() {
