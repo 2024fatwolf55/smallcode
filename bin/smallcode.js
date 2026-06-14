@@ -68,6 +68,7 @@ const { ToolScorer, checkAndEnforceHardFail, classifyTask, classifyTaskAsync } =
 const { EscalationEngine } = require('./escalation');
 const { EarlyStopDetector } = require('../src/governor/early_stop');
 const { QualityMonitor } = require('../src/governor/quality_monitor');
+const { normalizeToolCall } = require('../src/tools/tool_aliases');
 const { applyReadGuard } = require('../src/session/read_guard');
 const { TokenMonitor } = require('./token_monitor');
 const { TraceRecorder } = require('./trace_recorder');
@@ -1084,6 +1085,22 @@ async function runAgentLoop(userMessage, config) {
           }
         }
       } catch {}
+    }
+
+    // ── TOOL ALIAS NORMALIZATION ─────────────────────────────────────────
+    // Rename OpenAI/Claude-style tool names (Read, Edit, Bash, str_replace …)
+    // to SmallCode's real names BEFORE the quality monitor sees them so the
+    // monitor doesn't flag them as hallucinated, and before dispatch so the
+    // real handler runs. Also drop quality-monitor echo calls that small models
+    // sometimes parrot back as tool names, preventing the feedback loop.
+    if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+      message.tool_calls = message.tool_calls
+        .map(normalizeToolCall)
+        .filter(tc => {
+          if (!tc || !tc.function) return false;
+          const n = tc.function.name;
+          return n !== 'quality-monitor' && n !== 'quality_monitor';
+        });
     }
 
     // ── QUALITY MONITOR (itsy port) ──────────────────────────────────────

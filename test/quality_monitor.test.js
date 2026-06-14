@@ -10,7 +10,7 @@ test('empty response (no text + no tool calls) fires empty_response', () => {
   const sig = qm.inspect({ message: { content: '   ', tool_calls: [] }, knownTools: ['read_file'] });
   assert.ok(sig);
   assert.equal(sig.kind, 'empty_response');
-  assert.match(sig.injection, /\[QUALITY-MONITOR\]/);
+  assert.match(sig.injection, /Self-check note:/);
 });
 
 test('empty tool name fires empty_tool_name', () => {

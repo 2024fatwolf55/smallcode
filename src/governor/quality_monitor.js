@@ -58,7 +58,7 @@ class QualityMonitor {
       return this._fire({
         kind: 'empty_response',
         injection:
-          '[QUALITY-MONITOR] Your previous response had no text and no tool ' +
+          'Self-check note: Your previous response had no text and no tool ' +
           'calls. Continue the task — either reply to the user or invoke a ' +
           'tool. Do not return an empty turn.',
       });
@@ -72,7 +72,7 @@ class QualityMonitor {
         return this._fire({
           kind: 'empty_tool_name',
           injection:
-            '[QUALITY-MONITOR] You emitted a tool call with an empty name. ' +
+            'Self-check note: You emitted a tool call with an empty name. ' +
             'Restart the call with a real tool name. Available tools are ' +
             `listed in the system prompt (e.g. ${this._sampleTools(knownTools)}).`,
         });
@@ -88,7 +88,7 @@ class QualityMonitor {
           return this._fire({
             kind: 'hallucinated_tool',
             injection:
-              `[QUALITY-MONITOR] Tool "${name}" does not exist. Pick one ` +
+              `Self-check note: Tool "${name}" does not exist. Pick one ` +
               `from the registered tool list. Closest matches: ` +
               `${this._closestMatches(name, knownTools)}.`,
           });
@@ -107,7 +107,7 @@ class QualityMonitor {
           kind: 'repeat_call',
           signature: sig,
           injection:
-            `[QUALITY-MONITOR] You are repeating the same tool call ` +
+            `Self-check note: You are repeating the same tool call ` +
             `(${tc.function.name}) with identical arguments. The previous ` +
             'call already returned a result — read it before retrying. If ' +
             'you must retry, change the arguments first.',
