@@ -1164,7 +1164,15 @@ async function runAgentLoop(userMessage, config) {
     // SMALLCODE_QUALITY_MONITOR=false.
     try {
       if (String(process.env.SMALLCODE_QUALITY_MONITOR || 'true').toLowerCase() !== 'false') {
-        const knownTools = getAllTools(config, currentToolCategory)
+        // Hallucination check must validate against the FULL tool registry
+        // (all categories), NOT the current router category. A real tool
+        // invoked from a different category — e.g. write_file while the
+        // two-stage router has the model in 'read' — is NOT hallucinated: the
+        // dispatcher widens currentToolCategory to 'plan' (all essential tools)
+        // and runs it. Scoping knownTools to currentToolCategory caused false
+        // "Tool write_file does not exist" steers that derailed small models
+        // mid-task (e.g. minimax could never write a step's output file).
+        const knownTools = getAllTools(config, null)
           .map(t => t && t.function && t.function.name)
           .filter(Boolean);
         const signal = qualityMonitor.inspect({ message, knownTools });
