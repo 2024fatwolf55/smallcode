@@ -164,6 +164,7 @@ for (let i = 0; i < args.length; i++) {
   else if (arg === '-p' || arg === '--provider') { flags.provider = args[++i]; }
   else if (arg === '--endpoint' || arg === '--base-url') { flags.endpoint = args[++i]; }
   else if (arg === '-P' || arg === '--prompt') { flags.prompt = args[++i]; }
+  else if (arg === '--task') { flags.task = args[++i]; }
   else if (arg === '--eval') { flags.eval = args[++i] || 'classify_accuracy'; }
   else if (arg === '--trace') { flags.trace = args[++i]; }
   else positional.push(arg);
@@ -189,6 +190,7 @@ OPTIONS:
   -p, --provider <NAME>   Provider (ollama, openai, anthropic, llamacpp)
   --endpoint <URL>        OpenAI-compatible endpoint/base URL
   -P, --prompt <TEXT>     Run a single prompt non-interactively
+  --task <TEXT>           Boot the interactive TUI and auto-run TEXT as the first prompt
   -r, --resume            Resume last active session
   --non-interactive       Run single prompt, no TUI
   --classic             Use classic readline TUI (no alternate screen)
@@ -329,6 +331,16 @@ async function runTUI(config) {
     screen.enter();
     _fullscreenRef = screen;
 
+    // Auto-seed: if --task was given, fire its text through onSubmit once the event loop starts
+    if (flags.task) {
+      setImmediate(async () => {
+        screen.setStreaming(true);
+        await runAgentLoop(flags.task, config);
+        screen.setStreaming(false);
+        if (tokenTracker) screen.setTokenInfo(tokenTracker.formatShort());
+      });
+    }
+
     // Track current tool name for pairing stdout.write (tool start) with console.log (result)
     let _currentToolName = '';
 
@@ -376,6 +388,17 @@ async function runTUI(config) {
   });
 
   rl.prompt();
+
+  // Auto-seed: if --task was given, run it once before waiting for user input
+  if (flags.task) {
+    setImmediate(async () => {
+      console.log('');
+      await runAgentLoop(flags.task, config);
+      console.log('');
+      console.log(tui.renderStatus(config, conversationHistory.length));
+      rl.prompt();
+    });
+  }
 
   rl.on('line', async (line) => {
     const input = line.trim();
@@ -3130,7 +3153,8 @@ async function main() {
     return;
   }
 
-  if (flags.nonInteractive || flags.prompt || positional.length > 0) {
+  // --task boots the interactive TUI and auto-seeds the first prompt; never non-interactive
+  if (!flags.task && (flags.nonInteractive || flags.prompt || positional.length > 0)) {
     const prompt = flags.prompt || positional.join(' ');
     await runNonInteractive(config, prompt);
     return;
