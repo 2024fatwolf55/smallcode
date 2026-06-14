@@ -1177,8 +1177,15 @@ async function runAgentLoop(userMessage, config) {
           .filter(Boolean);
         const signal = qualityMonitor.inspect({ message, knownTools });
         if (signal) {
-          if (_fullscreenRef) _fullscreenRef.addTool('quality', 'warn', signal.kind);
-          else console.log(`  \x1b[33m⚠ quality-monitor: ${signal.kind}\x1b[0m`);
+          // SMALLCODE_QUALITY_MONITOR_QUIET=true suppresses the visible warning
+          // line but KEEPS the corrective steer (the injection below) — useful for
+          // driven/non-interactive runs where the ⚠ noise isn't wanted but the
+          // model should still be told the correct tool name.
+          const quiet = String(process.env.SMALLCODE_QUALITY_MONITOR_QUIET || 'false').toLowerCase() === 'true';
+          if (!quiet) {
+            if (_fullscreenRef) _fullscreenRef.addTool('quality', 'warn', signal.kind);
+            else console.log(`  \x1b[33m⚠ quality-monitor: ${signal.kind}\x1b[0m`);
+          }
           conversationHistory.push({ role: 'assistant', content: message.content || '' });
           conversationHistory.push({ role: 'user', content: signal.injection });
           continue;
