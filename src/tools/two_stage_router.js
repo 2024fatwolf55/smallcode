@@ -28,8 +28,8 @@ const TOOL_CATEGORIES = {
     tools: ['bash', 'run'],
   },
   plan: {
-    description: 'Load/save project memory, load skills, BoneScript compile/check',
-    tools: ['memory_load', 'memory_remember', 'use_skill', 'bone_compile', 'bone_check'],
+    description: 'Load/save project memory, load skills, spawn agents, BoneScript compile/check',
+    tools: ['memory_load', 'memory_remember', 'use_skill', 'bone_compile', 'bone_check', 'spawn_agent'],
   },
 };
 

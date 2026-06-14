@@ -871,6 +871,36 @@ async function executeTool(name, args, ctx) {
       return { result: formatSkillResult(skill, relatedEntries) };
     }
 
+    case 'spawn_agent': {
+      const agentName = String(args.agent || '').trim();
+      const agentTask = String(args.task || '').trim();
+      if (!agentName) return { error: 'spawn_agent: agent name is required' };
+      if (!agentTask) return { error: 'spawn_agent: task is required' };
+
+      try {
+        const { AgentLoader } = require('../src/plugins/agent_loader');
+        const { AgentRunner } = require('../src/plugins/agent_runner');
+        const loader = new AgentLoader(cwd);
+        const agentDef = loader.get(agentName);
+        if (!agentDef) {
+          const valid = loader.list().map(a => a.name);
+          return { error: `spawn_agent: agent "${agentName}" not found. Valid agents: ${valid.join(', ') || '(none defined)'}` };
+        }
+        const agentCtx = {
+          config,
+          flags: flags || {},
+          tui: tui || { renderDiff: () => null },
+          skillManager: ctx.skillManager || null,
+        };
+        const runner = new AgentRunner(agentDef, agentCtx);
+        const result = await runner.run(agentTask);
+        const summary = `[${agentName}] steps=${result.steps} tokens=${result.tokens}${result.error ? ' error=' + result.error : ''}`;
+        return { result: result.output ? `${summary}\n\n${result.output}` : summary };
+      } catch (e) {
+        return { error: `spawn_agent: ${e.message}` };
+      }
+    }
+
     case 'bone_compile': {
       const safe = safeResolvePath(args.path, cwd);
       if (!safe.ok) return { error: `bone_compile rejected: ${safe.reason}` };
