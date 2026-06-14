@@ -83,6 +83,9 @@ class SkillManager {
     }
     for (const entry of entries) {
       if (entry.isDirectory()) {
+        // drafts/ is quarantined — evolver proposals live there until a
+        // human promotes them (/evolve promote <name>). Never auto-load.
+        if (entry.name === 'drafts') continue;
         // <dir>/<name>/SKILL.md inside a standard skill dir — users following
         // the Claude Code layout expect this to work (closes #81)
         this._loadSkillFolder(path.join(dir, entry.name), entry.name);
@@ -242,6 +245,33 @@ class SkillManager {
     };
     this.skills.set(name, skill);
     return skill;
+  }
+
+  // Promote a quarantined draft (.smallcode/skills/drafts/<name>.md) into
+  // the live project skill dir and load it. Returns the new path or null.
+  promoteDraft(name) {
+    const safe = String(name || '').replace(/[^a-z0-9-_]/gi, '');
+    if (!safe) return null;
+    const draftsDir = path.join(this.projectDir, '.smallcode', 'skills', 'drafts');
+    const source = path.join(draftsDir, `${safe}.md`);
+    if (!fs.existsSync(source)) return null;
+    const target = path.join(this.projectDir, '.smallcode', 'skills', `${safe}.md`);
+    if (fs.existsSync(target)) return null; // never overwrite a live skill
+    fs.renameSync(source, target);
+    this._ingestFile(target, `${safe}.md`, path.dirname(target), safe, 'flat');
+    return target;
+  }
+
+  // List quarantined drafts (names only)
+  listDrafts() {
+    const draftsDir = path.join(this.projectDir, '.smallcode', 'skills', 'drafts');
+    try {
+      return fs.readdirSync(draftsDir)
+        .filter(f => f.endsWith('.md'))
+        .map(f => f.replace(/\.md$/i, ''));
+    } catch {
+      return [];
+    }
   }
 
   // Remove a skill

@@ -198,6 +198,7 @@ class FullScreenTUI {
       { cmd: '/cognition', alias: null, desc: 'MarrowScript cognition status' },
       { cmd: '/mcp', alias: null, desc: 'Connected MCP servers' },
       { cmd: '/skill', alias: null, desc: 'Manage reusable skills' },
+      { cmd: '/evolve', alias: null, desc: 'Propose skill from session friction' },
       { cmd: '/plugin', alias: null, desc: 'Manage plugins' },
       { cmd: '/sessions', alias: null, desc: 'List/resume sessions' },
       { cmd: '/session', alias: null, desc: 'Parallel sessions' },
