@@ -1164,6 +1164,16 @@ module.exports = function createCommandHandler(config, conversationHistory, impr
         return;
       }
 
+      case '/live': {
+        // Toggle the live activity feed features (issue #77).
+        const { resolveLiveCommand } = require('./live_settings');
+        const res = resolveLiveCommand(parts.slice(1).join(' '));
+        console.log(res.text);
+        console.log('');
+        rl.prompt();
+        return;
+      }
+
       case '/provider': {
         const sub = (parts[1] || '').trim();
         if (sub === 'status' || sub === '--status' || sub === '-s') {

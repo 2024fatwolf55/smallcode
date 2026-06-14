@@ -177,6 +177,8 @@ class FullScreenTUI {
 
     // Panel content buffers
     this.chatLines = [];         // Rendered chat messages
+    this._chatTrim = 0;          // count of chatLines trimmed off the front (issue #77 toolEnd anchoring)
+    this.contextMeter = '';      // live context-usage indicator (issue #77)
 
     // Mouse text selection in the chat panel (drag to highlight, copy on
     // release). Anchored to chatLines indices so scrolling doesn't shift it.
@@ -203,6 +205,7 @@ class FullScreenTUI {
       { cmd: '/stats', alias: null, desc: 'Session statistics' },
       { cmd: '/tokens', alias: null, desc: 'Token usage report' },
       { cmd: '/budget', alias: null, desc: 'Context window budget' },
+      { cmd: '/live', alias: null, desc: 'Toggle live activity feed' },
       { cmd: '/files', alias: null, desc: 'List project files' },
       { cmd: '/diff', alias: null, desc: 'Git diff summary' },
       { cmd: '/git', alias: null, desc: 'Run git command' },
@@ -645,9 +648,12 @@ class FullScreenTUI {
       actionStr = ' enter send │ /help commands';
     }
 
-    // 2. Middle: Scroll & Token info
+    // 2. Middle: Scroll & Token info (+ live context meter — issue #77)
     let scrollStr = this.chatScroll < 0 ? '↑ scrolled' : '';
     let tokenStr = this.tokenInfo ? `${this.tokenInfo}` : '';
+    if (this.contextMeter) {
+      tokenStr = tokenStr ? `${this.contextMeter} │ ${tokenStr}` : this.contextMeter;
+    }
     let middleStr = '';
     if (scrollStr && tokenStr) {
       middleStr = `${scrollStr} │ ${tokenStr}`;
@@ -1124,6 +1130,7 @@ class FullScreenTUI {
     // thousands of lines; rendering stays fast by only keeping recent history.
     const MAX_CHAT_LINES = 5000;
     if (this.chatLines.length > MAX_CHAT_LINES) {
+      this._chatTrim += this.chatLines.length - MAX_CHAT_LINES;
       this.chatLines.splice(0, this.chatLines.length - MAX_CHAT_LINES);
     }
 
@@ -1152,6 +1159,69 @@ class FullScreenTUI {
     this.chatLines.push(line);
     this.toolLines.push(toolPanelLine);
     this.chatScroll = 0;
+    this.render();
+  }
+
+  // Live in-progress tool line (issue #77). Pushes a ⚙ line to chat + tool
+  // panel and returns a handle so toolEnd() can rewrite it in place once the
+  // tool finishes — so the user sees "⚙ write_file: x.py" the moment it starts,
+  // not only the ✓ after it completes. The handle records absolute indices plus
+  // the trim offset at creation, so front-trimming of chatLines stays correct.
+  toolStart(name, detail) {
+    const iconColor = this.theme.accent;
+    const prefix = iconColor + '  TOOL ⚙ ' + this.theme.border + '│ ' + ANSI.reset;
+    const nameStr = name ? this.theme.accent + name + ANSI.reset + ': ' : '';
+    const detailStr = (detail ? this.theme.muted + detail : this.theme.muted + 'running…') + ANSI.reset;
+
+    const line = prefix + nameStr + detailStr;
+    const toolPanelLine = ` ${iconColor}⚙${ANSI.reset} ${nameStr}${detailStr}`;
+    const handle = { name, chatIdx: this.chatLines.length, toolIdx: this.toolLines.length, trim: this._chatTrim };
+
+    this.chatLines.push(line);
+    this.toolLines.push(toolPanelLine);
+    this.chatScroll = 0;
+    this.render();
+    return handle;
+  }
+
+  // Finish a live tool line started by toolStart(): rewrite it to ✓/✗ in place.
+  // Falls back to appending a fresh line (addTool) if the original scrolled out
+  // of the retained window or no handle was supplied.
+  toolEnd(handle, status, detail) {
+    if (!handle || handle.chatIdx == null) { this.addTool(handle && handle.name, status, detail); return; }
+
+    let icon = '⚙', iconColor = this.theme.accent;
+    if (status === 'ok') { icon = '✓'; iconColor = this.theme.success; }
+    else if (status === 'err') { icon = '✗'; iconColor = this.theme.error; }
+
+    const name = handle.name;
+    const prefix = iconColor + '  TOOL ' + icon + ' ' + this.theme.border + '│ ' + ANSI.reset;
+    const nameStr = name ? this.theme.accent + name + ANSI.reset + ': ' : '';
+    const detailStr = detail ? this.theme.muted + detail + ANSI.reset : '';
+    const line = prefix + nameStr + detailStr;
+    const toolPanelLine = ` ${iconColor}${icon}${ANSI.reset} ${nameStr}${detailStr}`;
+
+    const chatIdx = handle.chatIdx - (this._chatTrim - (handle.trim || 0));
+    if (chatIdx >= 0 && chatIdx < this.chatLines.length) {
+      this.chatLines[chatIdx] = line;
+    } else {
+      this.chatLines.push(line); // scrolled out of the retained window
+    }
+    if (handle.toolIdx != null && handle.toolIdx < this.toolLines.length) {
+      this.toolLines[handle.toolIdx] = toolPanelLine;
+    } else {
+      this.toolLines.push(toolPanelLine);
+    }
+    this.render();
+  }
+
+  // Live context-usage meter (issue #77). `pct` is 0-100; used/window are token
+  // counts. Rendered in the status footer alongside the token info.
+  setContextMeter(pct, used, window) {
+    if (pct == null) { this.contextMeter = ''; this.render(); return; }
+    const p = Math.max(0, Math.min(100, Math.round(pct)));
+    const fmt = (n) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+    this.contextMeter = window ? `ctx ${p}% (${fmt(used)}/${fmt(window)})` : `ctx ${p}%`;
     this.render();
   }
 

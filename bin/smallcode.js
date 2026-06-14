@@ -134,6 +134,36 @@ let tokenTracker = null;
 // Fullscreen TUI reference for streaming (set when fullscreen mode is active)
 let _fullscreenRef = null;
 
+// Live activity feed (issue #77). _activeToolHandle is the in-progress tool
+// line started in the dispatch loop (runAgentLoop) and finished in the
+// console.log override (runTUI) — module-scoped so both closures share it.
+const { getLiveSettings } = require('./live_settings');
+let _activeToolHandle = null;
+
+// One-line summary of a tool's most salient argument, for the live ⚙ line.
+function summarizeToolArgs(name, args) {
+  if (!args || typeof args !== 'object') return '';
+  const a = args;
+  const clip = (s, n = 48) => { s = String(s).replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n - 1) + '…' : s; };
+  if (a.path) return clip(a.path);
+  if (a.command) return clip(a.command);
+  if (a.pattern) return clip(a.pattern);
+  if (a.query) return clip(a.query);
+  if (a.task) return clip(a.task);
+  if (a.name) return clip(a.name);
+  return '';
+}
+
+// Push the current context usage to the footer meter (gated by /live context).
+function updateContextMeter() {
+  if (!_fullscreenRef || !getLiveSettings().context) return;
+  try {
+    const win = Number(config?.context?.detected_window) || 0;
+    const m = tokenMonitor.contextMeter(win);
+    if (m.window > 0) _fullscreenRef.setContextMeter(m.pct, m.used, m.window);
+  } catch {}
+}
+
 const VERSION = require('../package.json').version;
 const LOGO = `
   ⚡ SmallCode v${VERSION}
@@ -360,9 +390,18 @@ async function runTUI(config) {
       if (!clean) return;
       // Skip turn summaries unless verbose
       if (clean.startsWith('───') && !flags.verbose) return;
-      // Pair with current tool name for rich display
+      const isError = clean.startsWith('✗') || clean.includes('Exit code') || clean.includes('Timed out');
+      // Live tools (issue #77): finish the in-progress ⚙ line in place, then
+      // refresh the context meter now that the tool changed context.
+      if (_activeToolHandle) {
+        screen.toolEnd(_activeToolHandle, isError ? 'err' : 'ok', clean);
+        _activeToolHandle = null;
+        _currentToolName = '';
+        updateContextMeter();
+        return;
+      }
+      // Classic path: pair with the captured tool name for rich display.
       if (_currentToolName) {
-        const isError = clean.startsWith('✗') || clean.includes('Exit code') || clean.includes('Timed out');
         screen.addTool(_currentToolName, isError ? 'err' : 'ok', clean);
         _currentToolName = '';
       } else {
@@ -1018,6 +1057,9 @@ async function runAgentLoop(userMessage, config) {
       break;
     }
 
+    // Refresh the live context meter after each model turn (issue #77).
+    updateContextMeter();
+
     const message = response.choices?.[0]?.message;
     if (!message) break;
 
@@ -1259,8 +1301,15 @@ async function runAgentLoop(userMessage, config) {
           }
         }
 
-        // Show what's happening
-        process.stdout.write(tui.toolStart(toolName));
+        // Show what's happening. With live tools on (issue #77), push an
+        // in-progress ⚙ line now and rewrite it to ✓/✗ when the result lands
+        // (handled in the console.log override). Otherwise keep the classic
+        // capture-and-pair behavior.
+        if (_fullscreenRef && getLiveSettings().tools) {
+          _activeToolHandle = _fullscreenRef.toolStart(toolName, summarizeToolArgs(toolName, toolArgs));
+        } else {
+          process.stdout.write(tui.toolStart(toolName));
+        }
         const toolStart2 = Date.now();
 
         const result = await executeTool(toolName, toolArgs);
