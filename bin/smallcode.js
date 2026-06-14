@@ -1300,13 +1300,31 @@ async function runAgentLoop(userMessage, config) {
         // or — when context is already pressured — a head-only trim that
         // tells the model to grep first instead of re-reading. See
         // src/session/read_guard.js for the rationale.
-        // Override with SMALLCODE_MAX_TOOL_RESULT_CHARS env var.
+        // Cap tool results to protect small-model context. Controls:
+        //   SMALLCODE_MAX_TOOL_RESULT_CHARS=<n>  explicit char cap
+        //   SMALLCODE_MAX_TOOL_RESULT_CHARS=0|none|unlimited|off  NO cap at all
+        //   (unset)  default scales with the model window — large-window models
+        //            (>=131072 tokens, e.g. minimax-m3's 512K) are left UNCAPPED
+        //            since trimming only exists to protect small windows; small
+        //            models keep the 8000-char guard.
         const toolContent = result.result || result.error || '';
-        const maxToolResultChars = parseInt(process.env.SMALLCODE_MAX_TOOL_RESULT_CHARS) || 8000;
+        const _rawCap = String(process.env.SMALLCODE_MAX_TOOL_RESULT_CHARS || '').trim().toLowerCase();
+        const _detectedWindow = Number(config?.context?.detected_window) || 0;
+        let maxToolResultChars;
+        if (_rawCap === '0' || _rawCap === 'none' || _rawCap === 'unlimited' || _rawCap === 'off') {
+          maxToolResultChars = Infinity;            // explicit "remove the cap"
+        } else if (_rawCap) {
+          maxToolResultChars = parseInt(_rawCap) || 8000;
+        } else {
+          maxToolResultChars = _detectedWindow >= 131072 ? Infinity : 8000;
+        }
+        const unlimited = !Number.isFinite(maxToolResultChars);
         const headLines = parseInt(process.env.SMALLCODE_READ_GUARD_HEAD_LINES) || 30;
-        const guardOff = String(process.env.SMALLCODE_READ_GUARD || 'true').toLowerCase() === 'false';
+        const guardOff = unlimited || String(process.env.SMALLCODE_READ_GUARD || 'true').toLowerCase() === 'false';
         let cappedContent;
-        if (guardOff) {
+        if (unlimited) {
+          cappedContent = toolContent;              // no trimming whatsoever
+        } else if (guardOff) {
           cappedContent = toolContent.length > maxToolResultChars
             ? toolContent.slice(0, maxToolResultChars - 200) + '\n\n...(truncated, ' + toolContent.length + ' chars total)...\n' + toolContent.slice(-200)
             : toolContent;
