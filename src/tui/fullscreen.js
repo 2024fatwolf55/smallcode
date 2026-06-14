@@ -161,6 +161,12 @@ class FullScreenTUI {
 
     // Panel content buffers
     this.chatLines = [];         // Rendered chat messages
+
+    // Mouse text selection in the chat panel (drag to highlight, copy on
+    // release). Anchored to chatLines indices so scrolling doesn't shift it.
+    this.selection = null;       // { anchor: {line, col}, head: {line, col} }
+    this._selecting = false;
+    this._lastDragY = null;      // previous drag row — edge-dwell detection
     this.toolLines = [];         // Tool execution log
     this.inputBuffer = '';       // Current user input
     this.inputCursor = 0;       // Cursor position in input
@@ -332,7 +338,8 @@ class FullScreenTUI {
 
     for (let i = 0; i < this.chatHeight; i++) {
       buf += ANSI.moveTo(i + 1, 1);
-      const line = visible[i] || '';
+      let line = visible[i] || '';
+      if (this.selection) line = this._highlightSelection(startLine + i, line);
       buf += fitAnsi(line, this.chatWidth);
     }
 
@@ -905,6 +912,11 @@ class FullScreenTUI {
       this.render();
       return;
     }
+    // Mouse press / drag / release (SGR) — text selection in the chat panel.
+    // Only the chat region selects; tool panel and input area are ignored.
+    if (key.includes('\x1b[<')) {
+      if (this._onMouseSelect(key)) return;
+    }
 
     // Ctrl+L — clear and redraw
     if (key === '\x0c') {
@@ -1135,6 +1147,138 @@ class FullScreenTUI {
     this._lastLineIsStreaming = false;
     this.chatLines.push('');
     this.render();
+  }
+
+  // ─── Mouse selection ─────────────────────────────────────────────────
+
+  // Handle SGR mouse events for chat-panel text selection.
+  // Returns true when the chunk was consumed as selection input.
+  _onMouseSelect(data) {
+    const events = [...data.matchAll(/\x1b\[<(\d+);(\d+);(\d+)([Mm])/g)];
+    if (events.length === 0) return false;
+
+    let handled = false;
+    for (const ev of events) {
+      const btn = parseInt(ev[1]);
+      const x = parseInt(ev[2]); // 1-based column
+      const y = parseInt(ev[3]); // 1-based row
+      const isRelease = ev[4] === 'm';
+
+      // Left press inside the chat panel — start selecting
+      if (btn === 0 && !isRelease && !this._selecting) {
+        if (x <= this.chatWidth && y <= this.chatHeight) {
+          const pos = this._chatPosAt(x, y);
+          this.selection = { anchor: pos, head: pos };
+          this._selecting = true;
+          this._lastDragY = null;
+          handled = true;
+        } else {
+          // Click outside the chat panel clears any old highlight
+          if (this.selection) { this.selection = null; this.render(); }
+        }
+        continue;
+      }
+      // Drag with left button held — extend selection. Staying at the
+      // panel's top/bottom edge (repeated edge events) auto-scrolls so the
+      // selection can extend beyond the visible window; merely reaching the
+      // edge row selects it without scrolling.
+      if (btn === 32 && this._selecting) {
+        const prevY = this._lastDragY;
+        this._lastDragY = y;
+        if (y <= 1 && prevY !== null && prevY <= 1) {
+          const maxBack = -(Math.max(0, this.chatLines.length - this.chatHeight));
+          this.chatScroll = Math.max(maxBack, this.chatScroll - 1) || 0; // || 0 normalizes -0
+        } else if (y > this.chatHeight || (y === this.chatHeight && prevY !== null && prevY >= this.chatHeight)) {
+          this.chatScroll = Math.min(0, this.chatScroll + 1);
+        }
+        this.selection.head = this._chatPosAt(
+          Math.min(x, this.chatWidth),
+          Math.max(1, Math.min(y, this.chatHeight))
+        );
+        handled = true;
+        continue;
+      }
+      // Release — copy and clear
+      if (btn === 0 && isRelease && this._selecting) {
+        this._selecting = false;
+        this._lastDragY = null;
+        const text = this._extractSelection();
+        this.selection = null;
+        if (text) {
+          this._copyToClipboard(text);
+          const lines = text.split('\n').length;
+          this.addTool('clipboard', 'ok', `copied ${lines} line${lines === 1 ? '' : 's'}`);
+        }
+        handled = true;
+      }
+    }
+    if (handled) this.render();
+    return handled;
+  }
+
+  // Map a terminal (x, y) inside the chat panel to a chatLines position.
+  _chatPosAt(x, y) {
+    const startLine = Math.max(0, this.chatLines.length - this.chatHeight + this.chatScroll);
+    return { line: startLine + (y - 1), col: x - 1 };
+  }
+
+  // Chat lines carry a fixed 10-char gutter (8-char role label + '│ ').
+  // Selection clamps to the text area so the gutter never highlights or
+  // copies; a drag starting in the gutter selects from the text start.
+  static CHAT_GUTTER = 10;
+
+  // Selection with anchor/head ordered top-to-bottom.
+  _normalizedSelection() {
+    if (!this.selection) return null;
+    const { anchor: a, head: h } = this.selection;
+    if (a.line < h.line || (a.line === h.line && a.col <= h.col)) {
+      return { start: a, end: h };
+    }
+    return { start: h, end: a };
+  }
+
+  // Plain text covered by the current selection.
+  _extractSelection() {
+    const sel = this._normalizedSelection();
+    if (!sel) return '';
+    const gutter = FullScreenTUI.CHAT_GUTTER;
+    const out = [];
+    for (let i = sel.start.line; i <= sel.end.line; i++) {
+      if (i < 0 || i >= this.chatLines.length) continue;
+      const plain = this._stripAnsi(this.chatLines[i] || '');
+      const from = Math.max(gutter, i === sel.start.line ? sel.start.col : 0);
+      const to = i === sel.end.line ? sel.end.col + 1 : plain.length;
+      out.push(to > from ? plain.slice(from, to).replace(/\s+$/, '') : '');
+    }
+    return out.join('\n').replace(/\n+$/, '');
+  }
+
+  // Apply inverse-video highlight to the selected span of a chat line.
+  // Works on the ANSI-stripped text — colors drop while selected, which is
+  // the standard tradeoff for span-accurate highlighting.
+  _highlightSelection(lineIdx, line) {
+    const sel = this._normalizedSelection();
+    if (!sel || lineIdx < sel.start.line || lineIdx > sel.end.line) return line;
+    const gutter = FullScreenTUI.CHAT_GUTTER;
+    const plain = this._stripAnsi(line);
+    const from = Math.max(gutter, Math.min(
+      lineIdx === sel.start.line ? sel.start.col : 0, plain.length));
+    const to = lineIdx === sel.end.line ? Math.min(sel.end.col + 1, plain.length) : plain.length;
+    if (from >= to) return line;
+    return plain.slice(0, from) + '\x1b[7m' + plain.slice(from, to) + '\x1b[27m' + plain.slice(to);
+  }
+
+  _copyToClipboard(text) {
+    try {
+      const { execSync } = require('child_process');
+      if (process.platform === 'win32') {
+        execSync('powershell -noprofile -command "$input | Set-Clipboard"', { input: text, timeout: 3000 });
+      } else if (process.platform === 'darwin') {
+        execSync('pbcopy', { input: text, timeout: 3000 });
+      } else {
+        execSync('xclip -selection clipboard 2>/dev/null || xsel --clipboard --input 2>/dev/null', { input: text, timeout: 3000, shell: true });
+      }
+    } catch {}
   }
 
   // ─── Utilities ───────────────────────────────────────────────────────
