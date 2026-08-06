@@ -1,5 +1,8 @@
 # SmallCode
 
+[![commitmentissues](https://img.shields.io/badge/%F0%9F%AA%A6%20declared%20dead-view%20certificate-555?style=for-the-badge&labelColor=cc0000)](https://commitmentissues.dev/?repo=Doorman11991%2Fsmallcode)
+
+
 [简体中文](README_zh-CN.md) | [English](README.md)
 
 ---
