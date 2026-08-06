@@ -28,10 +28,14 @@ const TOOL_CATEGORIES = {
     tools: ['bash', 'run'],
   },
   plan: {
-    description: 'Load/save project memory, BoneScript compile/check',
-    tools: ['memory_load', 'memory_remember', 'bone_compile', 'bone_check'],
+    description: 'Load/save project memory, load skills, spawn agents, BoneScript compile/check',
+    tools: ['memory_load', 'memory_remember', 'use_skill', 'bone_compile', 'bone_check', 'spawn_agent'],
   },
 };
+
+// Cross-cutting tools appended to every category in Stage 2 — the skill
+// index is injected on every turn, so use_skill must always be callable.
+const ALWAYS_TOOLS = ['use_skill'];
 
 /**
  * Determine routing mode based on model's context window.
@@ -80,7 +84,7 @@ function getCategorySelectorTool() {
 function getToolsForCategory(category, allTools) {
   const cat = TOOL_CATEGORIES[category];
   if (!cat) return allTools; // Unknown category, fall back to all
-  return allTools.filter(t => cat.tools.includes(t.function.name));
+  return allTools.filter(t => cat.tools.includes(t.function.name) || ALWAYS_TOOLS.includes(t.function.name));
 }
 
 /**

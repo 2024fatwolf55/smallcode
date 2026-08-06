@@ -10,6 +10,7 @@ class TokenMonitor {
     this.totalCalls = 0;
     this.compactions = 0;
     this.evictions = 0;
+    this.lastPromptTokens = 0;
     this._nextCallIsNewTurn = false;
   }
 
@@ -20,6 +21,9 @@ class TokenMonitor {
     this.totalPrompt += promptTokens || 0;
     this.totalCompletion += completionTokens || 0;
     this.totalCalls++;
+    // Most recent prompt size = how much context is currently in play. Drives
+    // the live context meter (issue #77).
+    this.lastPromptTokens = promptTokens || 0;
 
     if (!this.turns.length || metadata.newTurn || this._nextCallIsNewTurn) {
       this.turns.push({ calls: 0, promptTokens: 0, completionTokens: 0, toolCalls: 0 });
@@ -34,6 +38,18 @@ class TokenMonitor {
 
   recordCompaction() { this.compactions++; }
   recordEviction() { this.evictions++; }
+
+  /**
+   * Live context-usage snapshot for the TUI meter (issue #77). `window` is the
+   * model's context length in tokens. Returns { pct, used, window } where
+   * `used` is the most recent prompt size.
+   */
+  contextMeter(window) {
+    const used = this.lastPromptTokens || 0;
+    const win = window || 0;
+    const pct = win > 0 ? (used / win) * 100 : 0;
+    return { pct, used, window: win };
+  }
 
   /**
    * Get efficiency metrics.

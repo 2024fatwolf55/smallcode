@@ -812,6 +812,19 @@ async function executeTool(name, args, ctx) {
         const objects = Array.isArray(raw) ? raw : (raw?.objects || []);
         const tokens_used = Array.isArray(raw) ? objects.length * 50 : (raw?.tokens_used || 0);
         if (objects.length === 0) return { result: 'No relevant memory found.' };
+        // Touch last_used_at so hygiene tier sweeps see real usage — an
+        // actively-retrieved entry must not age out. Never breaks retrieval.
+        for (const o of objects) {
+          try {
+            const now = new Date().toISOString();
+            if (typeof memoryStore.update === 'function') {
+              memoryStore.update(o.id, { last_used_at: now });
+            } else {
+              o.last_used_at = now;
+              if (typeof memoryStore.save === 'function') memoryStore.save();
+            }
+          } catch {}
+        }
         const formatted = objects.map(o => `[${o.type}] ${o.title}: ${o.content}`).join('\n\n');
         return { result: `Loaded ${objects.length} memories (${tokens_used} tokens):\n\n${formatted}` };
       }
@@ -838,6 +851,54 @@ async function executeTool(name, args, ctx) {
         return { result: ok ? `Deleted ${args.id}` : `Not found: ${args.id}` };
       }
       return { result: '' };
+    }
+
+    case 'use_skill': {
+      const skillManager = ctx.skillManager || null;
+      if (!skillManager) return { error: 'use_skill: skill system not available' };
+      const skillName = String(args.name || '').trim();
+      if (!skillName) return { error: 'use_skill: name is required' };
+      const skill = skillManager.get(skillName);
+      if (!skill) {
+        const validNames = skillManager.getIndex().map(e => e.name).slice(0, 10);
+        return { error: `use_skill: skill "${skillName}" not found. Valid names: ${validNames.join(', ')}` };
+      }
+      const { formatSkillResult } = require('../src/plugins/skill_index_formatter');
+      const index = skillManager.getIndex();
+      const relatedEntries = (skill.related || [])
+        .map(r => index.find(e => e.name === r))
+        .filter(Boolean);
+      return { result: formatSkillResult(skill, relatedEntries) };
+    }
+
+    case 'spawn_agent': {
+      const agentName = String(args.agent || '').trim();
+      const agentTask = String(args.task || '').trim();
+      if (!agentName) return { error: 'spawn_agent: agent name is required' };
+      if (!agentTask) return { error: 'spawn_agent: task is required' };
+
+      try {
+        const { AgentLoader } = require('../src/plugins/agent_loader');
+        const { AgentRunner } = require('../src/plugins/agent_runner');
+        const loader = new AgentLoader(cwd);
+        const agentDef = loader.get(agentName);
+        if (!agentDef) {
+          const valid = loader.list().map(a => a.name);
+          return { error: `spawn_agent: agent "${agentName}" not found. Valid agents: ${valid.join(', ') || '(none defined)'}` };
+        }
+        const agentCtx = {
+          config,
+          flags: flags || {},
+          tui: tui || { renderDiff: () => null },
+          skillManager: ctx.skillManager || null,
+        };
+        const runner = new AgentRunner(agentDef, agentCtx);
+        const result = await runner.run(agentTask);
+        const summary = `[${agentName}] steps=${result.steps} tokens=${result.tokens}${result.error ? ' error=' + result.error : ''}`;
+        return { result: result.output ? `${summary}\n\n${result.output}` : summary };
+      } catch (e) {
+        return { error: `spawn_agent: ${e.message}` };
+      }
     }
 
     case 'bone_compile': {

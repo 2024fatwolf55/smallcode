@@ -142,7 +142,15 @@ SMALLCODE_BASE_URL=http://localhost:1234/v1
 # OPENAI_API_KEY=sk-...
 # OPENROUTER_API_KEY=sk-or-v1-...
 # DEEPSEEK_API_KEY=sk-...
+
+# Optional: model response timeout in seconds (default 300 / 5 min).
+# Raise this for slow CPU-only llama.cpp servers that need >5 min per turn.
+# SMALLCODE_MODEL_TIMEOUT=1800
 ```
+
+The model response timeout can also be set in `smallcode.toml` under `[model]`
+as `timeout = <seconds>`. If a turn exceeds it you'll see
+`timeout: no response after <N>s` — raise `SMALLCODE_MODEL_TIMEOUT` to fix.
 
 See `.env.example` for all options. Also supports `smallcode.toml` for backwards compatibility.
 

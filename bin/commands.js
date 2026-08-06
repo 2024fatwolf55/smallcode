@@ -307,9 +307,42 @@ module.exports = function createCommandHandler(config, conversationHistory, impr
           } catch (e) {
             console.log(chalk.gray(`  Error: ${e.message}`));
           }
+        } else if (sub === 'hygiene') {
+          try {
+            const { runHygiene } = require('../src/memory/hygiene');
+            const result = runHygiene(memoryStore);
+            console.log(chalk.green(`  ✓ Hygiene complete: ${result.archived} archived, ${result.deleted} deleted`));
+            // Also write MEMORY.md index
+            const { renderMemoryIndex } = require('../src/memory/hygiene');
+            const md = renderMemoryIndex(memoryStore);
+            const fs = require('fs');
+            const path = require('path');
+            const outDir = path.join(process.cwd(), '.smallcode');
+            if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+            fs.writeFileSync(path.join(outDir, 'MEMORY.md'), md);
+            console.log(chalk.gray(`  Wrote .smallcode/MEMORY.md (${memoryStore.all().length} entries)`));
+          } catch (e) {
+            console.log(chalk.gray(`  Hygiene error: ${e.message}`));
+          }
+        } else if (sub === 'index') {
+          try {
+            const { renderMemoryIndex } = require('../src/memory/hygiene');
+            const md = renderMemoryIndex(memoryStore);
+            const fs = require('fs');
+            const path = require('path');
+            const outDir = path.join(process.cwd(), '.smallcode');
+            if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+            fs.writeFileSync(path.join(outDir, 'MEMORY.md'), md);
+            console.log(chalk.green(`  ✓ Wrote .smallcode/MEMORY.md`));
+            console.log(md.split('\n').slice(0, 10).map(l => '  ' + l).join('\n'));
+          } catch (e) {
+            console.log(chalk.gray(`  Index error: ${e.message}`));
+          }
         } else {
-          console.log(chalk.gray('  /memory         List stored memory'));
-          console.log(chalk.gray('  /memory clear   Clear all memory'));
+          console.log(chalk.gray('  /memory           List stored memory'));
+          console.log(chalk.gray('  /memory clear     Clear all memory'));
+          console.log(chalk.gray('  /memory hygiene   Sweep tiers, prune stale entries, write MEMORY.md'));
+          console.log(chalk.gray('  /memory index     Write .smallcode/MEMORY.md without sweeping'));
         }
         console.log('');
         rl.prompt();
@@ -829,6 +862,114 @@ module.exports = function createCommandHandler(config, conversationHistory, impr
         return;
       }
 
+      case '/agents': {
+        const { AgentLoader } = require('../src/plugins/agent_loader');
+        const loader = new AgentLoader(process.cwd());
+        const agents = loader.list();
+        if (agents.length === 0) {
+          console.log(chalk.gray('  No agents defined.'));
+          console.log(chalk.gray('  Create one: .smallcode/agents/<name>.md'));
+        } else {
+          console.log(chalk.bold(`  Agents (${agents.length}):`));
+          for (const a of agents) {
+            const toolList = a.tools.length ? chalk.gray(` [${a.tools.join(', ')}]`) : '';
+            const modelTag = a.model ? chalk.gray(` model:${a.model}`) : '';
+            console.log(`    ${chalk.cyan(a.name)}${toolList}${modelTag} ${chalk.gray(a.description)}`);
+          }
+        }
+        console.log('');
+        rl.prompt();
+        return;
+      }
+
+      case '/agent': {
+        const agentName = parts[1];
+        const agentTask = parts.slice(2).join(' ');
+        if (!agentName || !agentTask) {
+          console.log(chalk.gray('  Usage: /agent <name> <task...>'));
+          console.log('');
+          rl.prompt();
+          return;
+        }
+        const { AgentLoader: AgentLoaderA } = require('../src/plugins/agent_loader');
+        const { AgentRunner } = require('../src/plugins/agent_runner');
+        const loaderA = new AgentLoaderA(process.cwd());
+        const agentDef = loaderA.get(agentName);
+        if (!agentDef) {
+          const valid = loaderA.list().map(a => a.name);
+          console.log(chalk.red(`  Agent "${agentName}" not found. Valid: ${valid.join(', ') || '(none)'}`));
+          console.log('');
+          rl.prompt();
+          return;
+        }
+        console.log(chalk.gray(`  Running agent ${chalk.cyan(agentName)}...`));
+        const agentCtxA = { config, flags: {}, tui: require('./tui'), skillManager: null };
+        const runnerA = new AgentRunner(agentDef, agentCtxA);
+        const resultA = await runnerA.run(agentTask);
+        console.log('');
+        console.log(resultA.output || chalk.gray('(no output)'));
+        console.log('');
+        console.log(chalk.gray(`  steps=${resultA.steps} tokens=${resultA.tokens}${resultA.error ? ' error=' + resultA.error : ''}`));
+        console.log('');
+        rl.prompt();
+        return;
+      }
+
+      case '/teams': {
+        const { TeamLoader } = require('../src/plugins/team_loader');
+        const tloader = new TeamLoader(process.cwd());
+        const teams = tloader.list();
+        if (teams.length === 0) {
+          console.log(chalk.gray('  No teams defined.'));
+          console.log(chalk.gray('  Create one: .smallcode/teams/<name>.yaml'));
+        } else {
+          console.log(chalk.bold(`  Teams (${teams.length}):`));
+          for (const t of teams) {
+            console.log(`    ${chalk.cyan(t.name)} ${chalk.gray(`[${t.agents.join(' → ')}]`)} ${chalk.gray(t.description)}`);
+          }
+        }
+        console.log('');
+        rl.prompt();
+        return;
+      }
+
+      case '/team': {
+        const teamName = parts[1];
+        const teamTask = parts.slice(2).join(' ');
+        if (!teamName || !teamTask) {
+          console.log(chalk.gray('  Usage: /team <name> <task...>'));
+          console.log('');
+          rl.prompt();
+          return;
+        }
+        const { TeamLoader: TeamLoaderT } = require('../src/plugins/team_loader');
+        const { AgentLoader: AgentLoaderT } = require('../src/plugins/agent_loader');
+        const { runTeam } = require('../src/plugins/team_runner');
+        const tloaderT = new TeamLoaderT(process.cwd());
+        const teamDef = tloaderT.get(teamName);
+        if (!teamDef) {
+          const valid = tloaderT.list().map(t => t.name);
+          console.log(chalk.red(`  Team "${teamName}" not found. Valid: ${valid.join(', ') || '(none)'}`));
+          console.log('');
+          rl.prompt();
+          return;
+        }
+        console.log(chalk.gray(`  Running team ${chalk.cyan(teamName)} (${teamDef.agents.join(' → ')})...`));
+        const agentLoaderT = new AgentLoaderT(process.cwd());
+        const teamCtx = { config, flags: {}, tui: require('./tui'), skillManager: null };
+        const teamResult = await runTeam(teamDef, teamTask, teamCtx, agentLoaderT);
+        console.log('');
+        console.log(teamResult.output || chalk.gray('(no output)'));
+        console.log('');
+        for (const pa of teamResult.perAgent) {
+          const err = pa.error ? chalk.red(` error=${pa.error}`) : '';
+          console.log(chalk.gray(`  ${pa.name}: steps=${pa.steps} tokens=${pa.tokens}${err}`));
+        }
+        console.log('');
+        rl.prompt();
+        return;
+      }
+
       case '/help':
         console.log('');
         console.log(chalk.bold('  Commands'));
@@ -851,6 +992,11 @@ module.exports = function createCommandHandler(config, conversationHistory, impr
         console.log(`  ${chalk.cyan('/budget')}        ${chalk.gray('Show context window budget')}`);
         console.log(`  ${chalk.cyan('/mcp')}           ${chalk.gray('Show connected MCP servers')}`);
         console.log(`  ${chalk.cyan('/skill')}         ${chalk.gray('Manage reusable skills')}`);
+        console.log(`  ${chalk.cyan('/agents')}        ${chalk.gray('List defined sub-agents')}`);
+        console.log(`  ${chalk.cyan('/agent')} <n> <t> ${chalk.gray('Run a sub-agent manually')}`);
+        console.log(`  ${chalk.cyan('/teams')}         ${chalk.gray('List defined agent teams')}`);
+        console.log(`  ${chalk.cyan('/team')} <n> <t>  ${chalk.gray('Run a team pipeline')}`);
+        console.log(`  ${chalk.cyan('/evolve')}        ${chalk.gray('Propose a new skill from session friction (list|promote|log)')}`);
         console.log(`  ${chalk.cyan('/plugin')}        ${chalk.gray('List installed plugins')}`);
         console.log(`  ${chalk.cyan('/provider')}      ${chalk.gray('Configure LLM provider (interactive wizard)')}`);
         console.log(`  ${chalk.cyan('/sessions')}      ${chalk.gray('List/resume saved sessions')}`);
@@ -863,6 +1009,171 @@ module.exports = function createCommandHandler(config, conversationHistory, impr
         rl.prompt();
         return;
 
+      case '/evolve': {
+        const { SkillManager } = require('../src/plugins/skills');
+        const sm = new SkillManager(process.cwd());
+        const sub = (parts[1] || '').trim();
+
+        if (sub === 'list') {
+          const drafts = sm.listDrafts();
+          if (drafts.length === 0) {
+            console.log(chalk.gray('  No skill drafts. Run /evolve to analyze recent sessions.'));
+          } else {
+            console.log(chalk.bold(`  Drafts (${drafts.length}) — promote with /evolve promote <name>:`));
+            for (const d of drafts) console.log(`    ${chalk.cyan(d)}`);
+          }
+          console.log('');
+          rl.prompt();
+          return;
+        }
+
+        if (sub === 'promote') {
+          const name = (parts[2] || '').trim();
+          if (!name) { console.log(chalk.gray('  Usage: /evolve promote <name>')); }
+          else {
+            const target = sm.promoteDraft(name);
+            if (target) console.log(`  ${chalk.green('✓')} Promoted to ${chalk.cyan(target)} — active next session.`);
+            else console.log(chalk.red(`  Draft "${name}" not found (or a live skill with that name exists).`));
+          }
+          console.log('');
+          rl.prompt();
+          return;
+        }
+
+        if (sub === 'log') {
+          const { readEntries } = require('../src/plugins/audit_log');
+          const entries = readEntries(path.join(process.cwd(), '.smallcode', 'evolver-audit.jsonl'), 10);
+          if (entries.length === 0) console.log(chalk.gray('  No evolution events logged yet.'));
+          for (const e of entries) {
+            console.log(`  ${chalk.gray(e.ts)} ${chalk.cyan(e.name)} ${chalk.gray(e.rationale.slice(0, 60))}`);
+          }
+          console.log('');
+          rl.prompt();
+          return;
+        }
+
+        // No sub-command: run an evolution pass
+        const { TraceRecorder } = require('./trace_recorder');
+        const { extractFrictionSignals, formatReportForPrompt } = require('../src/plugins/friction_analyzer');
+        const evolver = require('../src/plugins/evolver');
+
+        const tr = new TraceRecorder(process.cwd());
+        const traceList = tr.list().slice(0, 20);
+        if (traceList.length < 3) {
+          console.log(chalk.gray(`  Only ${traceList.length} trace(s) recorded — need at least 3 sessions of data.`));
+          console.log('');
+          rl.prompt();
+          return;
+        }
+        const traces = traceList.map(t => tr.load(t.id)).filter(Boolean);
+
+        const skillKeywords = sm.list().flatMap(s => s.keywords || []);
+        const report = extractFrictionSignals(traces, { skillKeywords });
+        const signalCount = report.repeated_patterns.length + report.tool_retry_loops.length;
+        if (signalCount === 0) {
+          console.log(chalk.gray(`  No friction patterns in last ${traces.length} traces. Nothing to evolve.`));
+          console.log('');
+          rl.prompt();
+          return;
+        }
+
+        console.log(chalk.bold(`  Friction signals (${signalCount}):`));
+        console.log(chalk.gray(formatReportForPrompt(report).split('\n').map(l => '  ' + l).join('\n')));
+
+        // LLM judgment — route to the strong tier when configured
+        const { getModelTarget, buildAuthHeaders, withModelTarget } = require('./config');
+        const target = getModelTarget(config, 'strong');
+        process.stdout.write(chalk.gray(`  Asking ${target.model} for a proposal... `));
+
+        const sysPrompt = 'You design reusable skills for a coding agent. A skill is a short markdown instruction injected when relevant. Given friction signals from recent sessions, propose ONE skill addressing the most impactful pattern. Respond with ONLY a JSON object: {"name": "kebab-case-name", "description": "one line", "trigger": "match", "keywords": ["k1","k2"], "body": "markdown instructions for the agent", "rationale": "why this helps"}';
+        let proposalRaw = null;
+        try {
+          const resp = await fetch(`${target.baseUrl}/chat/completions`, {
+            method: 'POST',
+            headers: buildAuthHeaders(withModelTarget(config, target)),
+            body: JSON.stringify({
+              model: target.model,
+              messages: [
+                { role: 'system', content: sysPrompt },
+                { role: 'user', content: `Friction signals:\n${formatReportForPrompt(report)}` },
+              ],
+              temperature: 0.2,
+              max_tokens: 1024,
+            }),
+          });
+          if (resp.ok) {
+            const data = await resp.json();
+            proposalRaw = data?.choices?.[0]?.message?.content || null;
+          } else {
+            console.log(chalk.red(`HTTP ${resp.status}`));
+          }
+        } catch (e) {
+          console.log(chalk.red(e.message));
+        }
+        if (!proposalRaw) { console.log(''); rl.prompt(); return; }
+
+        // Forgiving parse: strict JSON → fenced JSON → abort with raw output
+        let parsed = null;
+        try { parsed = JSON.parse(proposalRaw); } catch {
+          const m = proposalRaw.match(/\{[\s\S]*\}/);
+          if (m) { try { parsed = JSON.parse(m[0]); } catch {} }
+        }
+        if (!parsed) {
+          console.log(chalk.yellow('could not parse'));
+          console.log(chalk.gray('  Raw model output (nothing written):'));
+          console.log(chalk.gray('  ' + proposalRaw.slice(0, 500).split('\n').join('\n  ')));
+          console.log('');
+          rl.prompt();
+          return;
+        }
+        console.log(chalk.green('ok'));
+
+        const proposal = evolver.buildSkillProposal(
+          String(parsed.name || ''), String(parsed.description || ''), String(parsed.body || ''),
+          { trigger: parsed.trigger, keywords: parsed.keywords, rationale: String(parsed.rationale || '') }
+        );
+        const errors = evolver.validateProposal(proposal);
+        if (errors.length) {
+          console.log(chalk.red(`  Proposal rejected: ${errors.join('; ')}`));
+          console.log('');
+          rl.prompt();
+          return;
+        }
+        const collision = evolver.checkNameCollision(proposal.name, process.cwd());
+        if (collision) {
+          console.log(chalk.red(`  Name collision with ${collision} — nothing written.`));
+          console.log('');
+          rl.prompt();
+          return;
+        }
+
+        const run = new evolver.EvolverRun();
+        const draftPath = run.writeDraft(proposal, process.cwd());
+        evolver.logCreateEvent(
+          path.join(process.cwd(), '.smallcode', 'evolver-audit.jsonl'),
+          proposal, proposal.rationale,
+          report.repeated_patterns.flatMap(p => p.traceIds).concat(report.tool_retry_loops.flatMap(l => l.traceIds))
+        );
+
+        console.log('');
+        console.log(`  ${chalk.green('✓')} Draft: ${chalk.cyan(draftPath)}`);
+        console.log(chalk.gray(`    "${proposal.description}"`));
+        console.log(chalk.gray(`    Review the file, then: /evolve promote ${proposal.name}`));
+        console.log('');
+        rl.prompt();
+        return;
+      }
+
+      case '/live': {
+        // Toggle the live activity feed features (issue #77).
+        const { resolveLiveCommand } = require('./live_settings');
+        const res = resolveLiveCommand(parts.slice(1).join(' '));
+        console.log(res.text);
+        console.log('');
+        rl.prompt();
+        return;
+      }
+
       case '/provider': {
         const sub = (parts[1] || '').trim();
         if (sub === 'status' || sub === '--status' || sub === '-s') {
@@ -870,7 +1181,7 @@ module.exports = function createCommandHandler(config, conversationHistory, impr
           console.log(pProviderStatus());
         } else {
           const pWizard = require('./provider-wizard/wizard');
-          const result = await pWizard.runWizard({ interactive: true });
+          const result = await pWizard.runWizard({ interactive: true, rl });
           if (result.success) {
             console.log(result.provider || '');
           }

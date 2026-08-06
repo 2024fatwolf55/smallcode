@@ -54,6 +54,22 @@ function visualCursorPosition(str, cursorIdx, maxVisualWidth) {
   return { line, col };
 }
 
+// Word-boundary helpers for input editing (issue #93). A "word" is a run of
+// non-whitespace characters. Movement skips any whitespace adjacent to the
+// cursor before scanning over the word, mirroring readline/Windows behaviour.
+function prevWordBoundary(str, idx) {
+  let i = idx;
+  while (i > 0 && /\s/.test(str[i - 1])) i--;        // skip whitespace to the left
+  while (i > 0 && !/\s/.test(str[i - 1])) i--;        // skip the word itself
+  return i;
+}
+function nextWordBoundary(str, idx) {
+  let i = idx;
+  while (i < str.length && /\s/.test(str[i])) i++;    // skip whitespace to the right
+  while (i < str.length && !/\s/.test(str[i])) i++;   // skip the word itself
+  return i;
+}
+
 // ─── ANSI Escape Sequences ───────────────────────────────────────────────────
 
 const ESC = '\x1b[';
@@ -161,6 +177,14 @@ class FullScreenTUI {
 
     // Panel content buffers
     this.chatLines = [];         // Rendered chat messages
+    this._chatTrim = 0;          // count of chatLines trimmed off the front (issue #77 toolEnd anchoring)
+    this.contextMeter = '';      // live context-usage indicator (issue #77)
+
+    // Mouse text selection in the chat panel (drag to highlight, copy on
+    // release). Anchored to chatLines indices so scrolling doesn't shift it.
+    this.selection = null;       // { anchor: {line, col}, head: {line, col} }
+    this._selecting = false;
+    this._lastDragY = null;      // previous drag row — edge-dwell detection
     this.toolLines = [];         // Tool execution log
     this.inputBuffer = '';       // Current user input
     this.inputCursor = 0;       // Cursor position in input
@@ -176,10 +200,12 @@ class FullScreenTUI {
       { cmd: '/quit', alias: '/q', desc: 'Exit SmallCode' },
       { cmd: '/clear', alias: null, desc: 'Reset conversation' },
       { cmd: '/model', alias: null, desc: 'Show/switch model' },
+      { cmd: '/provider', alias: null, desc: 'Show provider / configure model' },
       { cmd: '/endpoint', alias: null, desc: 'Switch API endpoint' },
       { cmd: '/stats', alias: null, desc: 'Session statistics' },
       { cmd: '/tokens', alias: null, desc: 'Token usage report' },
       { cmd: '/budget', alias: null, desc: 'Context window budget' },
+      { cmd: '/live', alias: null, desc: 'Toggle live activity feed' },
       { cmd: '/files', alias: null, desc: 'List project files' },
       { cmd: '/diff', alias: null, desc: 'Git diff summary' },
       { cmd: '/git', alias: null, desc: 'Run git command' },
@@ -192,6 +218,11 @@ class FullScreenTUI {
       { cmd: '/cognition', alias: null, desc: 'MarrowScript cognition status' },
       { cmd: '/mcp', alias: null, desc: 'Connected MCP servers' },
       { cmd: '/skill', alias: null, desc: 'Manage reusable skills' },
+      { cmd: '/agents', alias: null, desc: 'List defined sub-agents' },
+      { cmd: '/agent', alias: null, desc: 'Run a sub-agent manually' },
+      { cmd: '/teams', alias: null, desc: 'List defined agent teams' },
+      { cmd: '/team', alias: null, desc: 'Run a team pipeline' },
+      { cmd: '/evolve', alias: null, desc: 'Propose skill from session friction' },
       { cmd: '/plugin', alias: null, desc: 'Manage plugins' },
       { cmd: '/sessions', alias: null, desc: 'List/resume sessions' },
       { cmd: '/session', alias: null, desc: 'Parallel sessions' },
@@ -332,7 +363,8 @@ class FullScreenTUI {
 
     for (let i = 0; i < this.chatHeight; i++) {
       buf += ANSI.moveTo(i + 1, 1);
-      const line = visible[i] || '';
+      let line = visible[i] || '';
+      if (this.selection) line = this._highlightSelection(startLine + i, line);
       buf += fitAnsi(line, this.chatWidth);
     }
 
@@ -616,9 +648,12 @@ class FullScreenTUI {
       actionStr = ' enter send │ /help commands';
     }
 
-    // 2. Middle: Scroll & Token info
+    // 2. Middle: Scroll & Token info (+ live context meter — issue #77)
     let scrollStr = this.chatScroll < 0 ? '↑ scrolled' : '';
     let tokenStr = this.tokenInfo ? `${this.tokenInfo}` : '';
+    if (this.contextMeter) {
+      tokenStr = tokenStr ? `${this.contextMeter} │ ${tokenStr}` : this.contextMeter;
+    }
     let middleStr = '';
     if (scrollStr && tokenStr) {
       middleStr = `${scrollStr} │ ${tokenStr}`;
@@ -879,6 +914,60 @@ class FullScreenTUI {
       return;
     }
 
+    // ─── Line / word navigation (issue #93) ──────────────────────────────
+    // Home / Ctrl+A — start of line. Terminals send Home as \x1b[H, \x1b[1~,
+    // or \x1bOH depending on mode; Ctrl+A arrives as the raw byte \x01.
+    if (key === '\x1b[H' || key === '\x1b[1~' || key === '\x1bOH' || key === '\x01') {
+      this.inputCursor = 0;
+      this.render();
+      return;
+    }
+    // End / Ctrl+E — end of line (\x1b[F, \x1b[4~, \x1bOF, or Ctrl+E = \x05).
+    if (key === '\x1b[F' || key === '\x1b[4~' || key === '\x1bOF' || key === '\x05') {
+      this.inputCursor = this.inputBuffer.length;
+      this.render();
+      return;
+    }
+    // Ctrl+Left — previous word (\x1b[1;5D, and Alt+B = \x1bb as a fallback).
+    if (key === '\x1b[1;5D' || key === '\x1b[1;3D' || key === '\x1bb') {
+      this.inputCursor = prevWordBoundary(this.inputBuffer, this.inputCursor);
+      this.render();
+      return;
+    }
+    // Ctrl+Right — next word (\x1b[1;5C, and Alt+F = \x1bf as a fallback).
+    if (key === '\x1b[1;5C' || key === '\x1b[1;3C' || key === '\x1bf') {
+      this.inputCursor = nextWordBoundary(this.inputBuffer, this.inputCursor);
+      this.render();
+      return;
+    }
+    // Ctrl+Backspace / Ctrl+W — delete the word to the left of the cursor.
+    // Ctrl+Backspace reaches us as \x17 (Ctrl+W) or \x1b\x7f on many terminals.
+    if (key === '\x17' || key === '\x1b\x7f' || key === '\x1b\b') {
+      const start = prevWordBoundary(this.inputBuffer, this.inputCursor);
+      this.inputBuffer = this.inputBuffer.slice(0, start) + this.inputBuffer.slice(this.inputCursor);
+      this.inputCursor = start;
+      this.commandPaletteOpen = this.inputBuffer.startsWith('/');
+      this.render();
+      return;
+    }
+    // Ctrl+Delete — delete the word to the right of the cursor (\x1b[3;5~).
+    if (key === '\x1b[3;5~' || key === '\x1b[3;3~') {
+      const end = nextWordBoundary(this.inputBuffer, this.inputCursor);
+      this.inputBuffer = this.inputBuffer.slice(0, this.inputCursor) + this.inputBuffer.slice(end);
+      this.commandPaletteOpen = this.inputBuffer.startsWith('/');
+      this.render();
+      return;
+    }
+    // Delete (forward) — remove the character under the cursor (\x1b[3~).
+    if (key === '\x1b[3~') {
+      if (this.inputCursor < this.inputBuffer.length) {
+        this.inputBuffer = this.inputBuffer.slice(0, this.inputCursor) + this.inputBuffer.slice(this.inputCursor + 1);
+        this.commandPaletteOpen = this.inputBuffer.startsWith('/');
+      }
+      this.render();
+      return;
+    }
+
     // Scroll chat — PgUp/PgDn, Shift+Up/Down, mouse wheel
     if (key === '\x1b[5~' || key === '\x1b[1;2A') { // PgUp or Shift+Up
       const maxBack = -(Math.max(0, this.chatLines.length - this.chatHeight));
@@ -905,6 +994,20 @@ class FullScreenTUI {
       this.render();
       return;
     }
+    // Right-click — paste from clipboard (issue #96). Enabling SGR mouse
+    // tracking makes the terminal forward right-clicks to us instead of
+    // showing its native paste menu, so we honour the gesture ourselves.
+    // SGR button 2 (right) press is "\x1b[<2;X;YM", release "\x1b[<2;X;Ym".
+    if (/^\x1b\[<2;\d+;\d+m$/.test(key)) {
+      this._pasteFromClipboard();
+      return;
+    }
+
+    // Mouse press / drag / release (SGR) — text selection in the chat panel.
+    // Only the chat region selects; tool panel and input area are ignored.
+    if (key.includes('\x1b[<')) {
+      if (this._onMouseSelect(key)) return;
+    }
 
     // Ctrl+L — clear and redraw
     if (key === '\x0c') {
@@ -912,27 +1015,9 @@ class FullScreenTUI {
       return;
     }
 
-    // Ctrl+V — paste from clipboard (Windows)
+    // Ctrl+V — paste from clipboard (issue #96: right-click also routes here)
     if (key === '\x16') {
-      try {
-        const { execSync } = require('child_process');
-        let clipboard = '';
-        if (process.platform === 'win32') {
-          clipboard = execSync('powershell -command "Get-Clipboard"', { encoding: 'utf-8', timeout: 3000 }).trim();
-        } else if (process.platform === 'darwin') {
-          clipboard = execSync('pbpaste', { encoding: 'utf-8', timeout: 3000 }).trim();
-        } else {
-          clipboard = execSync('xclip -selection clipboard -o 2>/dev/null || xsel --clipboard --output 2>/dev/null', { encoding: 'utf-8', timeout: 3000, shell: true }).trim();
-        }
-        if (clipboard) {
-          // Replace newlines with spaces for input line
-          const text = clipboard.replace(/[\r\n]+/g, ' ');
-          this.inputBuffer = this.inputBuffer.slice(0, this.inputCursor) + text + this.inputBuffer.slice(this.inputCursor);
-          this.inputCursor += text.length;
-          this.commandPaletteOpen = this.inputBuffer.startsWith('/');
-          this.render();
-        }
-      } catch {}
+      this._pasteFromClipboard();
       return;
     }
 
@@ -957,6 +1042,30 @@ class FullScreenTUI {
         this.render();
       }
     }
+  }
+
+  // Insert clipboard contents at the cursor. Shared by Ctrl+V and the
+  // right-click gesture (issue #96). Newlines collapse to spaces so the
+  // single-line input stays intact.
+  _pasteFromClipboard() {
+    try {
+      const { execSync } = require('child_process');
+      let clipboard = '';
+      if (process.platform === 'win32') {
+        clipboard = execSync('powershell -command "Get-Clipboard"', { encoding: 'utf-8', timeout: 3000 }).trim();
+      } else if (process.platform === 'darwin') {
+        clipboard = execSync('pbpaste', { encoding: 'utf-8', timeout: 3000 }).trim();
+      } else {
+        clipboard = execSync('xclip -selection clipboard -o 2>/dev/null || xsel --clipboard --output 2>/dev/null', { encoding: 'utf-8', timeout: 3000, shell: true }).trim();
+      }
+      if (clipboard) {
+        const text = clipboard.replace(/[\r\n]+/g, ' ');
+        this.inputBuffer = this.inputBuffer.slice(0, this.inputCursor) + text + this.inputBuffer.slice(this.inputCursor);
+        this.inputCursor += text.length;
+        this.commandPaletteOpen = this.inputBuffer.startsWith('/');
+        this.render();
+      }
+    } catch {}
   }
 
   _onResize() {
@@ -1021,6 +1130,7 @@ class FullScreenTUI {
     // thousands of lines; rendering stays fast by only keeping recent history.
     const MAX_CHAT_LINES = 5000;
     if (this.chatLines.length > MAX_CHAT_LINES) {
+      this._chatTrim += this.chatLines.length - MAX_CHAT_LINES;
       this.chatLines.splice(0, this.chatLines.length - MAX_CHAT_LINES);
     }
 
@@ -1049,6 +1159,69 @@ class FullScreenTUI {
     this.chatLines.push(line);
     this.toolLines.push(toolPanelLine);
     this.chatScroll = 0;
+    this.render();
+  }
+
+  // Live in-progress tool line (issue #77). Pushes a ⚙ line to chat + tool
+  // panel and returns a handle so toolEnd() can rewrite it in place once the
+  // tool finishes — so the user sees "⚙ write_file: x.py" the moment it starts,
+  // not only the ✓ after it completes. The handle records absolute indices plus
+  // the trim offset at creation, so front-trimming of chatLines stays correct.
+  toolStart(name, detail) {
+    const iconColor = this.theme.accent;
+    const prefix = iconColor + '  TOOL ⚙ ' + this.theme.border + '│ ' + ANSI.reset;
+    const nameStr = name ? this.theme.accent + name + ANSI.reset + ': ' : '';
+    const detailStr = (detail ? this.theme.muted + detail : this.theme.muted + 'running…') + ANSI.reset;
+
+    const line = prefix + nameStr + detailStr;
+    const toolPanelLine = ` ${iconColor}⚙${ANSI.reset} ${nameStr}${detailStr}`;
+    const handle = { name, chatIdx: this.chatLines.length, toolIdx: this.toolLines.length, trim: this._chatTrim };
+
+    this.chatLines.push(line);
+    this.toolLines.push(toolPanelLine);
+    this.chatScroll = 0;
+    this.render();
+    return handle;
+  }
+
+  // Finish a live tool line started by toolStart(): rewrite it to ✓/✗ in place.
+  // Falls back to appending a fresh line (addTool) if the original scrolled out
+  // of the retained window or no handle was supplied.
+  toolEnd(handle, status, detail) {
+    if (!handle || handle.chatIdx == null) { this.addTool(handle && handle.name, status, detail); return; }
+
+    let icon = '⚙', iconColor = this.theme.accent;
+    if (status === 'ok') { icon = '✓'; iconColor = this.theme.success; }
+    else if (status === 'err') { icon = '✗'; iconColor = this.theme.error; }
+
+    const name = handle.name;
+    const prefix = iconColor + '  TOOL ' + icon + ' ' + this.theme.border + '│ ' + ANSI.reset;
+    const nameStr = name ? this.theme.accent + name + ANSI.reset + ': ' : '';
+    const detailStr = detail ? this.theme.muted + detail + ANSI.reset : '';
+    const line = prefix + nameStr + detailStr;
+    const toolPanelLine = ` ${iconColor}${icon}${ANSI.reset} ${nameStr}${detailStr}`;
+
+    const chatIdx = handle.chatIdx - (this._chatTrim - (handle.trim || 0));
+    if (chatIdx >= 0 && chatIdx < this.chatLines.length) {
+      this.chatLines[chatIdx] = line;
+    } else {
+      this.chatLines.push(line); // scrolled out of the retained window
+    }
+    if (handle.toolIdx != null && handle.toolIdx < this.toolLines.length) {
+      this.toolLines[handle.toolIdx] = toolPanelLine;
+    } else {
+      this.toolLines.push(toolPanelLine);
+    }
+    this.render();
+  }
+
+  // Live context-usage meter (issue #77). `pct` is 0-100; used/window are token
+  // counts. Rendered in the status footer alongside the token info.
+  setContextMeter(pct, used, window) {
+    if (pct == null) { this.contextMeter = ''; this.render(); return; }
+    const p = Math.max(0, Math.min(100, Math.round(pct)));
+    const fmt = (n) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+    this.contextMeter = window ? `ctx ${p}% (${fmt(used)}/${fmt(window)})` : `ctx ${p}%`;
     this.render();
   }
 
@@ -1131,10 +1304,161 @@ class FullScreenTUI {
     this.render();
   }
 
+  // Live dimmed reasoning preview (issue #77, Phase B). Streams thinking tokens
+  // into a single collapsing dimmed line so the user can watch the model reason
+  // without flooding the chat. Reset by endStream() at turn boundaries.
+  streamThinking(token) {
+    const dim = '\x1b[2m';
+    const prefix = '        ' + this.theme.border + '│ ' + ANSI.reset + dim + '[thinking] ';
+    if (this._thinkingLineIdx == null || this._thinkingLineIdx >= this.chatLines.length) {
+      this._thinkingLineIdx = this.chatLines.length;
+      this._thinkingText = '';
+      this.chatLines.push(prefix + ANSI.reset);
+    }
+    this._thinkingText += token;
+    const tail = this._thinkingText.replace(/\s+/g, ' ').trim().slice(-120);
+    this.chatLines[this._thinkingLineIdx] = prefix + tail + ANSI.reset;
+    this.chatScroll = 0;
+    this.render();
+  }
+
   endStream() {
     this._lastLineIsStreaming = false;
+    this._thinkingLineIdx = null;
     this.chatLines.push('');
     this.render();
+  }
+
+  // ─── Mouse selection ─────────────────────────────────────────────────
+
+  // Handle SGR mouse events for chat-panel text selection.
+  // Returns true when the chunk was consumed as selection input.
+  _onMouseSelect(data) {
+    const events = [...data.matchAll(/\x1b\[<(\d+);(\d+);(\d+)([Mm])/g)];
+    if (events.length === 0) return false;
+
+    let handled = false;
+    for (const ev of events) {
+      const btn = parseInt(ev[1]);
+      const x = parseInt(ev[2]); // 1-based column
+      const y = parseInt(ev[3]); // 1-based row
+      const isRelease = ev[4] === 'm';
+
+      // Left press inside the chat panel — start selecting
+      if (btn === 0 && !isRelease && !this._selecting) {
+        if (x <= this.chatWidth && y <= this.chatHeight) {
+          const pos = this._chatPosAt(x, y);
+          this.selection = { anchor: pos, head: pos };
+          this._selecting = true;
+          this._lastDragY = null;
+          handled = true;
+        } else {
+          // Click outside the chat panel clears any old highlight
+          if (this.selection) { this.selection = null; this.render(); }
+        }
+        continue;
+      }
+      // Drag with left button held — extend selection. Staying at the
+      // panel's top/bottom edge (repeated edge events) auto-scrolls so the
+      // selection can extend beyond the visible window; merely reaching the
+      // edge row selects it without scrolling.
+      if (btn === 32 && this._selecting) {
+        const prevY = this._lastDragY;
+        this._lastDragY = y;
+        if (y <= 1 && prevY !== null && prevY <= 1) {
+          const maxBack = -(Math.max(0, this.chatLines.length - this.chatHeight));
+          this.chatScroll = Math.max(maxBack, this.chatScroll - 1) || 0; // || 0 normalizes -0
+        } else if (y > this.chatHeight || (y === this.chatHeight && prevY !== null && prevY >= this.chatHeight)) {
+          this.chatScroll = Math.min(0, this.chatScroll + 1);
+        }
+        this.selection.head = this._chatPosAt(
+          Math.min(x, this.chatWidth),
+          Math.max(1, Math.min(y, this.chatHeight))
+        );
+        handled = true;
+        continue;
+      }
+      // Release — copy and clear
+      if (btn === 0 && isRelease && this._selecting) {
+        this._selecting = false;
+        this._lastDragY = null;
+        const text = this._extractSelection();
+        this.selection = null;
+        if (text) {
+          this._copyToClipboard(text);
+          const lines = text.split('\n').length;
+          this.addTool('clipboard', 'ok', `copied ${lines} line${lines === 1 ? '' : 's'}`);
+        }
+        handled = true;
+      }
+    }
+    if (handled) this.render();
+    return handled;
+  }
+
+  // Map a terminal (x, y) inside the chat panel to a chatLines position.
+  _chatPosAt(x, y) {
+    const startLine = Math.max(0, this.chatLines.length - this.chatHeight + this.chatScroll);
+    return { line: startLine + (y - 1), col: x - 1 };
+  }
+
+  // Chat lines carry a fixed 10-char gutter (8-char role label + '│ ').
+  // Selection clamps to the text area so the gutter never highlights or
+  // copies; a drag starting in the gutter selects from the text start.
+  static CHAT_GUTTER = 10;
+
+  // Selection with anchor/head ordered top-to-bottom.
+  _normalizedSelection() {
+    if (!this.selection) return null;
+    const { anchor: a, head: h } = this.selection;
+    if (a.line < h.line || (a.line === h.line && a.col <= h.col)) {
+      return { start: a, end: h };
+    }
+    return { start: h, end: a };
+  }
+
+  // Plain text covered by the current selection.
+  _extractSelection() {
+    const sel = this._normalizedSelection();
+    if (!sel) return '';
+    const gutter = FullScreenTUI.CHAT_GUTTER;
+    const out = [];
+    for (let i = sel.start.line; i <= sel.end.line; i++) {
+      if (i < 0 || i >= this.chatLines.length) continue;
+      const plain = this._stripAnsi(this.chatLines[i] || '');
+      const from = Math.max(gutter, i === sel.start.line ? sel.start.col : 0);
+      const to = i === sel.end.line ? sel.end.col + 1 : plain.length;
+      out.push(to > from ? plain.slice(from, to).replace(/\s+$/, '') : '');
+    }
+    return out.join('\n').replace(/\n+$/, '');
+  }
+
+  // Apply inverse-video highlight to the selected span of a chat line.
+  // Works on the ANSI-stripped text — colors drop while selected, which is
+  // the standard tradeoff for span-accurate highlighting.
+  _highlightSelection(lineIdx, line) {
+    const sel = this._normalizedSelection();
+    if (!sel || lineIdx < sel.start.line || lineIdx > sel.end.line) return line;
+    const gutter = FullScreenTUI.CHAT_GUTTER;
+    const plain = this._stripAnsi(line);
+    const from = Math.max(gutter, Math.min(
+      lineIdx === sel.start.line ? sel.start.col : 0, plain.length));
+    const to = lineIdx === sel.end.line ? Math.min(sel.end.col + 1, plain.length) : plain.length;
+    if (from >= to) return line;
+    return plain.slice(0, from) + '\x1b[7m' + plain.slice(from, to) + '\x1b[27m' + plain.slice(to);
+  }
+
+  _copyToClipboard(text) {
+    try {
+      const { execSync } = require('child_process');
+      if (process.platform === 'win32') {
+        execSync('powershell -noprofile -command "$input | Set-Clipboard"', { input: text, timeout: 3000 });
+      } else if (process.platform === 'darwin') {
+        execSync('pbcopy', { input: text, timeout: 3000 });
+      } else {
+        execSync('xclip -selection clipboard 2>/dev/null || xsel --clipboard --input 2>/dev/null', { input: text, timeout: 3000, shell: true });
+      }
+    } catch {}
   }
 
   // ─── Utilities ───────────────────────────────────────────────────────

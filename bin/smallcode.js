@@ -68,6 +68,7 @@ const { ToolScorer, checkAndEnforceHardFail, classifyTask, classifyTaskAsync } =
 const { EscalationEngine } = require('./escalation');
 const { EarlyStopDetector } = require('../src/governor/early_stop');
 const { QualityMonitor } = require('../src/governor/quality_monitor');
+const { normalizeToolCall } = require('../src/tools/tool_aliases');
 const { applyReadGuard } = require('../src/session/read_guard');
 const { TokenMonitor } = require('./token_monitor');
 const { TraceRecorder } = require('./trace_recorder');
@@ -133,6 +134,39 @@ let tokenTracker = null;
 // Fullscreen TUI reference for streaming (set when fullscreen mode is active)
 let _fullscreenRef = null;
 
+// Live activity feed (issue #77). _activeToolHandle is the in-progress tool
+// line started in the dispatch loop (runAgentLoop) and finished in the
+// console.log override (runTUI) — module-scoped so both closures share it.
+const { getLiveSettings } = require('./live_settings');
+let _activeToolHandle = null;
+// True when the current turn's assistant content was already shown live via
+// streamToken, so the post-turn addChat('assistant') must not render it again.
+let _contentStreamed = false;
+
+// One-line summary of a tool's most salient argument, for the live ⚙ line.
+function summarizeToolArgs(name, args) {
+  if (!args || typeof args !== 'object') return '';
+  const a = args;
+  const clip = (s, n = 48) => { s = String(s).replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n - 1) + '…' : s; };
+  if (a.path) return clip(a.path);
+  if (a.command) return clip(a.command);
+  if (a.pattern) return clip(a.pattern);
+  if (a.query) return clip(a.query);
+  if (a.task) return clip(a.task);
+  if (a.name) return clip(a.name);
+  return '';
+}
+
+// Push the current context usage to the footer meter (gated by /live context).
+function updateContextMeter() {
+  if (!_fullscreenRef || !getLiveSettings().context) return;
+  try {
+    const win = Number(config?.context?.detected_window) || 0;
+    const m = tokenMonitor.contextMeter(win);
+    if (m.window > 0) _fullscreenRef.setContextMeter(m.pct, m.used, m.window);
+  } catch {}
+}
+
 const VERSION = require('../package.json').version;
 const LOGO = `
   ⚡ SmallCode v${VERSION}
@@ -164,6 +198,7 @@ for (let i = 0; i < args.length; i++) {
   else if (arg === '-p' || arg === '--provider') { flags.provider = args[++i]; }
   else if (arg === '--endpoint' || arg === '--base-url') { flags.endpoint = args[++i]; }
   else if (arg === '-P' || arg === '--prompt') { flags.prompt = args[++i]; }
+  else if (arg === '--task') { flags.task = args[++i]; }
   else if (arg === '--eval') { flags.eval = args[++i] || 'classify_accuracy'; }
   else if (arg === '--trace') { flags.trace = args[++i]; }
   else positional.push(arg);
@@ -189,6 +224,7 @@ OPTIONS:
   -p, --provider <NAME>   Provider (ollama, openai, anthropic, llamacpp)
   --endpoint <URL>        OpenAI-compatible endpoint/base URL
   -P, --prompt <TEXT>     Run a single prompt non-interactively
+  --task <TEXT>           Boot the interactive TUI and auto-run TEXT as the first prompt
   -r, --resume            Resume last active session
   --non-interactive       Run single prompt, no TUI
   --classic             Use classic readline TUI (no alternate screen)
@@ -287,6 +323,7 @@ async function runTUI(config) {
       onCommand: async (cmd) => {
         if (cmd === '/quit' || cmd === '/q' || cmd === '/exit') {
           if (sessionStore) sessionStore.save(conversationHistory, { tokens: tokenTracker ? tokenTracker.stats() : undefined });
+          try { if (memoryStore) { const { runHygiene } = require('../src/memory/hygiene'); runHygiene(memoryStore); } } catch {}
           screen.leave();
           killMCP()
           process.exit(0);
@@ -299,8 +336,15 @@ async function runTUI(config) {
         console.log = (...args) => { captured += args.join(' ') + '\n'; };
         // Create a mock rl for command handler
         const mockRl = { prompt: () => {}, close: () => { screen.leave(); process.exit(0); } };
+        // Some commands (e.g. /provider's interactive wizard) need a real
+        // stdin/stdout the fullscreen TUI captures, so they silently did nothing
+        // (issue #80). resolveTuiCommand swaps them for a non-interactive
+        // equivalent plus guidance. See ./tui_commands for the mapping.
+        const { resolveTuiCommand } = require('./tui_commands');
+        const { command: routedCmd, guidance } = resolveTuiCommand(cmd);
         try {
-          await handleCmd(cmd, mockRl);
+          await handleCmd(routedCmd, mockRl);
+          if (guidance) captured += guidance;
         } catch (e) {
           captured += `Error: ${e.message}\n`;
         }
@@ -318,6 +362,7 @@ async function runTUI(config) {
         if (sessionStore) {
           sessionStore.save(conversationHistory, { tokens: tokenTracker ? tokenTracker.stats() : undefined });
         }
+        try { if (memoryStore) { const { runHygiene } = require('../src/memory/hygiene'); runHygiene(memoryStore); } } catch {}
         killMCP()
         process.exit(0);
       },
@@ -326,6 +371,16 @@ async function runTUI(config) {
     // Enter fullscreen FIRST (captures real stdout.write as _rawWrite)
     screen.enter();
     _fullscreenRef = screen;
+
+    // Auto-seed: if --task was given, fire its text through onSubmit once the event loop starts
+    if (flags.task) {
+      setImmediate(async () => {
+        screen.setStreaming(true);
+        await runAgentLoop(flags.task, config);
+        screen.setStreaming(false);
+        if (tokenTracker) screen.setTokenInfo(tokenTracker.formatShort());
+      });
+    }
 
     // Track current tool name for pairing stdout.write (tool start) with console.log (result)
     let _currentToolName = '';
@@ -338,9 +393,18 @@ async function runTUI(config) {
       if (!clean) return;
       // Skip turn summaries unless verbose
       if (clean.startsWith('───') && !flags.verbose) return;
-      // Pair with current tool name for rich display
+      const isError = clean.startsWith('✗') || clean.includes('Exit code') || clean.includes('Timed out');
+      // Live tools (issue #77): finish the in-progress ⚙ line in place, then
+      // refresh the context meter now that the tool changed context.
+      if (_activeToolHandle) {
+        screen.toolEnd(_activeToolHandle, isError ? 'err' : 'ok', clean);
+        _activeToolHandle = null;
+        _currentToolName = '';
+        updateContextMeter();
+        return;
+      }
+      // Classic path: pair with the captured tool name for rich display.
       if (_currentToolName) {
-        const isError = clean.startsWith('✗') || clean.includes('Exit code') || clean.includes('Timed out');
         screen.addTool(_currentToolName, isError ? 'err' : 'ok', clean);
         _currentToolName = '';
       } else {
@@ -374,6 +438,17 @@ async function runTUI(config) {
   });
 
   rl.prompt();
+
+  // Auto-seed: if --task was given, run it once before waiting for user input
+  if (flags.task) {
+    setImmediate(async () => {
+      console.log('');
+      await runAgentLoop(flags.task, config);
+      console.log('');
+      console.log(tui.renderStatus(config, conversationHistory.length));
+      rl.prompt();
+    });
+  }
 
   rl.on('line', async (line) => {
     const input = line.trim();
@@ -444,6 +519,7 @@ async function executeTool(name, args) {
     flags,
     config,
     tui,
+    skillManager,
   });
 
   try { if (dedup) dedup.record(name, args, result); } catch {}
@@ -592,7 +668,7 @@ async function runAgentLoop(userMessage, config) {
     if (message?.content) {
       conversationHistory.push({ role: 'assistant', content: message.content });
       if (_fullscreenRef) {
-        _fullscreenRef.addChat('assistant', message.content);
+        if (!_contentStreamed) _fullscreenRef.addChat('assistant', message.content);
       } else {
         process.stdout.write(tui.renderMarkdown(message.content));
       }
@@ -984,6 +1060,9 @@ async function runAgentLoop(userMessage, config) {
       break;
     }
 
+    // Refresh the live context meter after each model turn (issue #77).
+    updateContextMeter();
+
     const message = response.choices?.[0]?.message;
     if (!message) break;
 
@@ -1060,6 +1139,22 @@ async function runAgentLoop(userMessage, config) {
       } catch {}
     }
 
+    // ── TOOL ALIAS NORMALIZATION ─────────────────────────────────────────
+    // Rename OpenAI/Claude-style tool names (Read, Edit, Bash, str_replace …)
+    // to SmallCode's real names BEFORE the quality monitor sees them so the
+    // monitor doesn't flag them as hallucinated, and before dispatch so the
+    // real handler runs. Also drop quality-monitor echo calls that small models
+    // sometimes parrot back as tool names, preventing the feedback loop.
+    if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+      message.tool_calls = message.tool_calls
+        .map(normalizeToolCall)
+        .filter(tc => {
+          if (!tc || !tc.function) return false;
+          const n = tc.function.name;
+          return n !== 'quality-monitor' && n !== 'quality_monitor';
+        });
+    }
+
     // ── QUALITY MONITOR (itsy port) ──────────────────────────────────────
     // Catches structural failure modes the model emitted on this turn:
     // empty turns, blank tool names, hallucinated tool names, and exact
@@ -1069,13 +1164,28 @@ async function runAgentLoop(userMessage, config) {
     // SMALLCODE_QUALITY_MONITOR=false.
     try {
       if (String(process.env.SMALLCODE_QUALITY_MONITOR || 'true').toLowerCase() !== 'false') {
-        const knownTools = getAllTools(config, currentToolCategory)
+        // Hallucination check must validate against the FULL tool registry
+        // (all categories), NOT the current router category. A real tool
+        // invoked from a different category — e.g. write_file while the
+        // two-stage router has the model in 'read' — is NOT hallucinated: the
+        // dispatcher widens currentToolCategory to 'plan' (all essential tools)
+        // and runs it. Scoping knownTools to currentToolCategory caused false
+        // "Tool write_file does not exist" steers that derailed small models
+        // mid-task (e.g. minimax could never write a step's output file).
+        const knownTools = getAllTools(config, null)
           .map(t => t && t.function && t.function.name)
           .filter(Boolean);
         const signal = qualityMonitor.inspect({ message, knownTools });
         if (signal) {
-          if (_fullscreenRef) _fullscreenRef.addTool('quality', 'warn', signal.kind);
-          else console.log(`  \x1b[33m⚠ quality-monitor: ${signal.kind}\x1b[0m`);
+          // SMALLCODE_QUALITY_MONITOR_QUIET=true suppresses the visible warning
+          // line but KEEPS the corrective steer (the injection below) — useful for
+          // driven/non-interactive runs where the ⚠ noise isn't wanted but the
+          // model should still be told the correct tool name.
+          const quiet = String(process.env.SMALLCODE_QUALITY_MONITOR_QUIET || 'false').toLowerCase() === 'true';
+          if (!quiet) {
+            if (_fullscreenRef) _fullscreenRef.addTool('quality', 'warn', signal.kind);
+            else console.log(`  \x1b[33m⚠ quality-monitor: ${signal.kind}\x1b[0m`);
+          }
           conversationHistory.push({ role: 'assistant', content: message.content || '' });
           conversationHistory.push({ role: 'user', content: signal.injection });
           continue;
@@ -1209,8 +1319,15 @@ async function runAgentLoop(userMessage, config) {
           }
         }
 
-        // Show what's happening
-        process.stdout.write(tui.toolStart(toolName));
+        // Show what's happening. With live tools on (issue #77), push an
+        // in-progress ⚙ line now and rewrite it to ✓/✗ when the result lands
+        // (handled in the console.log override). Otherwise keep the classic
+        // capture-and-pair behavior.
+        if (_fullscreenRef && getLiveSettings().tools) {
+          _activeToolHandle = _fullscreenRef.toolStart(toolName, summarizeToolArgs(toolName, toolArgs));
+        } else {
+          process.stdout.write(tui.toolStart(toolName));
+        }
         const toolStart2 = Date.now();
 
         const result = await executeTool(toolName, toolArgs);
@@ -1274,13 +1391,31 @@ async function runAgentLoop(userMessage, config) {
         // or — when context is already pressured — a head-only trim that
         // tells the model to grep first instead of re-reading. See
         // src/session/read_guard.js for the rationale.
-        // Override with SMALLCODE_MAX_TOOL_RESULT_CHARS env var.
+        // Cap tool results to protect small-model context. Controls:
+        //   SMALLCODE_MAX_TOOL_RESULT_CHARS=<n>  explicit char cap
+        //   SMALLCODE_MAX_TOOL_RESULT_CHARS=0|none|unlimited|off  NO cap at all
+        //   (unset)  default scales with the model window — large-window models
+        //            (>=131072 tokens, e.g. minimax-m3's 512K) are left UNCAPPED
+        //            since trimming only exists to protect small windows; small
+        //            models keep the 8000-char guard.
         const toolContent = result.result || result.error || '';
-        const maxToolResultChars = parseInt(process.env.SMALLCODE_MAX_TOOL_RESULT_CHARS) || 8000;
+        const _rawCap = String(process.env.SMALLCODE_MAX_TOOL_RESULT_CHARS || '').trim().toLowerCase();
+        const _detectedWindow = Number(config?.context?.detected_window) || 0;
+        let maxToolResultChars;
+        if (_rawCap === '0' || _rawCap === 'none' || _rawCap === 'unlimited' || _rawCap === 'off') {
+          maxToolResultChars = Infinity;            // explicit "remove the cap"
+        } else if (_rawCap) {
+          maxToolResultChars = parseInt(_rawCap) || 8000;
+        } else {
+          maxToolResultChars = _detectedWindow >= 131072 ? Infinity : 8000;
+        }
+        const unlimited = !Number.isFinite(maxToolResultChars);
         const headLines = parseInt(process.env.SMALLCODE_READ_GUARD_HEAD_LINES) || 30;
-        const guardOff = String(process.env.SMALLCODE_READ_GUARD || 'true').toLowerCase() === 'false';
+        const guardOff = unlimited || String(process.env.SMALLCODE_READ_GUARD || 'true').toLowerCase() === 'false';
         let cappedContent;
-        if (guardOff) {
+        if (unlimited) {
+          cappedContent = toolContent;              // no trimming whatsoever
+        } else if (guardOff) {
           cappedContent = toolContent.length > maxToolResultChars
             ? toolContent.slice(0, maxToolResultChars - 200) + '\n\n...(truncated, ' + toolContent.length + ' chars total)...\n' + toolContent.slice(-200)
             : toolContent;
@@ -1785,9 +1920,9 @@ Read the FULL file above carefully. Fix ALL errors. Use the patch tool with the 
           }
         }
       } catch {}
-      // Render with markdown highlighting
+      // Render with markdown highlighting (skip if already shown live — #77)
       if (_fullscreenRef) {
-        _fullscreenRef.addChat('assistant', message.content);
+        if (!_contentStreamed) _fullscreenRef.addChat('assistant', message.content);
       } else {
         process.stdout.write(tui.renderMarkdown(message.content));
       }
@@ -2086,21 +2221,29 @@ function getMemoryContext(messages) {
   }
 }
 
-// Auto-load relevant skills based on the user's message
+// Auto-load relevant skills based on the user's message.
 // Fix #18: Cap skill injection to ~1000 tokens (4000 chars). Multiple matching
 // skills can each be a full .md file, quickly blowing up the system prompt.
+//
+// Lazy-skills: always inject the compact index (one line per skill, ~8 tokens each)
+// so the model can call use_skill to pull any body on demand. Auto-matched skill
+// bodies are appended after the index, subject to the 4000-char aggregate cap.
 function getSkillContext(messages) {
   if (!skillManager) return '';
   try {
+    const { formatSkillIndex } = require('../src/plugins/skill_index_formatter');
+    const index = skillManager.getIndex();
+    const indexStr = formatSkillIndex(index);
+
     const lastUser = [...messages].reverse().find(m => m.role === 'user');
-    if (!lastUser) return '';
-    const skills = skillManager.getAutoSkills(lastUser.content);
-    if (skills.length === 0) return '';
-    const formatted = skillManager.formatForPrompt(skills);
+    const autoSkills = lastUser ? skillManager.getAutoSkills(lastUser.content) : [];
+    const autoFormatted = skillManager.formatForPrompt(autoSkills);
+
+    const combined = indexStr + (autoFormatted ? '\n' + autoFormatted : '');
     // Hard cap: truncate if too long
-    return formatted.length > 4000
-      ? formatted.slice(0, 4000) + '\n... (skills truncated to fit context)'
-      : formatted;
+    return combined.length > 4000
+      ? combined.slice(0, 4000) + '\n... (skills truncated to fit context)'
+      : combined;
   } catch {
     return '';
   }
@@ -2398,6 +2541,15 @@ async function chatCompletion(config, messages) {
       }
     }
 
+    // Live streaming (issue #77, Phase B): opt-in via /live stream. Only when a
+    // fullscreen TUI is attached to receive tokens. Request usage in the final
+    // chunk so the context meter still updates.
+    const wantStream = !!(_fullscreenRef && getLiveSettings().stream);
+    if (wantStream) {
+      body.stream = true;
+      body.stream_options = { include_usage: true };
+    }
+
     let response;
     try {
       response = await fetch(`${baseUrl}/chat/completions`, {
@@ -2449,7 +2601,8 @@ async function chatCompletion(config, messages) {
           const retry = await fetch(`${baseUrl}/chat/completions`, {
             method: 'POST',
             headers,
-            body: JSON.stringify(body),
+            // Retry non-streamed so the JSON parse below is unambiguous.
+            body: JSON.stringify({ ...body, stream: false, stream_options: undefined }),
           });
           if (retry.ok) return await retry.json();
         } catch {}
@@ -2462,7 +2615,42 @@ async function chatCompletion(config, messages) {
       return null;
     }
 
-    const data = await response.json();
+    // Consume the response. When streaming (Phase B), assemble the SSE deltas
+    // back into the same `data` shape the non-streaming path produces, driving
+    // the live chat/thinking views as tokens arrive. On any streaming failure,
+    // fall back to whatever was assembled so far. The non-streaming path is
+    // unchanged.
+    let data;
+    if (wantStream && response.body && typeof response.body.getReader === 'function') {
+      const { StreamAssembler, parseSSEBuffer } = require('./stream_assembler');
+      const assembler = new StreamAssembler();
+      const showThinking = getLiveSettings().thinking;
+      try {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const { events, rest } = parseSSEBuffer(buf);
+          buf = rest;
+          for (const ev of events) {
+            if (ev.done || !ev.json) continue;
+            assembler.pushChunk(ev.json, {
+              onContent: (t) => { if (_fullscreenRef) _fullscreenRef.streamToken(t); },
+              onReasoning: showThinking ? (t) => { if (_fullscreenRef) _fullscreenRef.streamThinking(t); } : undefined,
+            });
+          }
+        }
+      } catch { /* fall through with whatever assembled so far */ }
+      if (_fullscreenRef) _fullscreenRef.endStream();
+      data = assembler.toData();
+      _contentStreamed = !!(_fullscreenRef && assembler.content);
+    } else {
+      data = await response.json();
+      _contentStreamed = false;
+    }
 
     // Length-truncation recovery: reasoning models served via LM Studio
     // (lfm2.x, Qwen3, DeepSeek R1) expose a separate `reasoning_content`
@@ -2546,6 +2734,7 @@ async function chatCompletion(config, messages) {
       });
       sessionStore.autoTitle(conversationHistory);
     }
+    try { if (memoryStore) { const { runHygiene } = require('../src/memory/hygiene'); runHygiene(memoryStore); } } catch {}
 
     return data;
   } catch (err) {
@@ -3043,17 +3232,23 @@ async function main() {
 
   skillManager = new SkillManager(process.cwd());
 
-  // Initialize MCP client (connect to external MCP servers)
+  // Initialize MCP client (connect to external MCP servers).
+  // Skipped entirely in --mcp server mode: an MCP server must not also act as
+  // an MCP host. Otherwise a self-referential `smallcode --mcp` entry in
+  // mcp.json makes each server spawn another server recursively — an unbounded
+  // fork bomb that exhausts RAM (issue #82).
   let mcpClient = null;
-  const mcpClientInstance = new MCPClient(process.cwd());
-  if (mcpClientInstance.loadConfig() > 0) {
-    mcpClient = mcpClientInstance;
-    // Connect asynchronously — don't block boot
-    mcpClient.connectAll().then(toolCount => {
-      if (toolCount > 0 && _fullscreenRef) {
-        _fullscreenRef.addTool('mcp-client', 'ok', `${toolCount} external tools from ${mcpClient.servers.size} servers`);
-      }
-    }).catch(() => {});
+  if (!flags.mcp) {
+    const mcpClientInstance = new MCPClient(process.cwd());
+    if (mcpClientInstance.loadConfig() > 0) {
+      mcpClient = mcpClientInstance;
+      // Connect asynchronously — don't block boot
+      mcpClient.connectAll().then(toolCount => {
+        if (toolCount > 0 && _fullscreenRef) {
+          _fullscreenRef.addTool('mcp-client', 'ok', `${toolCount} external tools from ${mcpClient.servers.size} servers`);
+        }
+      }).catch(() => {});
+    }
   }
 
   // Initialize session + token tracking
@@ -3118,7 +3313,8 @@ async function main() {
     return;
   }
 
-  if (flags.nonInteractive || flags.prompt || positional.length > 0) {
+  // --task boots the interactive TUI and auto-seeds the first prompt; never non-interactive
+  if (!flags.task && (flags.nonInteractive || flags.prompt || positional.length > 0)) {
     const prompt = flags.prompt || positional.join(' ');
     await runNonInteractive(config, prompt);
     return;

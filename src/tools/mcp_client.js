@@ -46,6 +46,10 @@ class MCPClient {
         const servers = content.mcpServers || {};
         for (const [name, cfg] of Object.entries(servers)) {
           if (cfg.disabled) continue;
+          // Skip a self-referential entry that relaunches smallcode in --mcp
+          // mode. Combined with the host-side guard, this prevents the fork
+          // bomb from issue #82 even if a stale/bad mcp.json registers it.
+          if (MCPClient._isSelfReference(cfg)) continue;
           this.servers.set(name, {
             config: {
               name,
@@ -63,6 +67,20 @@ class MCPClient {
     }
 
     return this.servers.size;
+  }
+
+  /**
+   * Detect a server config that would relaunch SmallCode itself as an MCP
+   * server (`smallcode --mcp`, `node smallcode.js --mcp`, `npx smallcode --mcp`,
+   * `smolv2 --mcp`, …). Spawning these from the MCP client is what produced the
+   * runaway process fork bomb in issue #82.
+   */
+  static _isSelfReference(cfg) {
+    if (!cfg) return false;
+    const args = Array.isArray(cfg.args) ? cfg.args : [];
+    if (!args.includes('--mcp')) return false;
+    const hay = [cfg.command || '', ...args].join(' ').toLowerCase();
+    return /\bsmallcode\b|smallcode\.js|\bsmolv2\b/.test(hay);
   }
 
   /**

@@ -98,6 +98,42 @@ test('list() reports nested skills with origin marker', () => {
   assert.equal(nested.origin, 'nested');
 });
 
+test('issue #81: nested <name>/SKILL.md inside .smallcode/skills is detected', () => {
+  const dir = freshProject();
+  const skillFile = path.join(dir, '.smallcode', 'skills', 'my-skill', 'SKILL.md');
+  write(skillFile, '# my skill\n\nDo nested things.');
+
+  const sm = new SkillManager(dir);
+  const got = sm.get('my-skill');
+  assert.ok(got, 'nested skill inside .smallcode/skills should load');
+  assert.equal(got.origin, 'nested');
+  assert.match(got.content, /Do nested things\./);
+});
+
+test('issue #81: flat .md without frontmatter loads as manual skill', () => {
+  const dir = freshProject();
+  write(path.join(dir, '.smallcode', 'skills', 'plain.md'),
+        '# Plain Skill\n\nNo frontmatter here.');
+
+  const sm = new SkillManager(dir);
+  const got = sm.get('plain');
+  assert.ok(got, 'frontmatter-less flat skill should load');
+  assert.equal(got.trigger, 'manual');
+  assert.equal(got.origin, 'flat');
+  assert.match(got.content, /No frontmatter here\./);
+});
+
+test('issue #81: README-style files in skill dirs are not skills', () => {
+  const dir = freshProject();
+  write(path.join(dir, '.smallcode', 'skills', 'README.md'), '# About these skills');
+  write(path.join(dir, '.smallcode', 'skills', 'real.md'),
+        '---\nname: real\ntrigger: manual\n---\nreal body');
+
+  const sm = new SkillManager(dir);
+  assert.equal(sm.get('README'), null);
+  assert.ok(sm.get('real'));
+});
+
 test('add() persists a new skill and round-trips through .smallcode/skills', () => {
   const dir = freshProject();
   const sm = new SkillManager(dir);
